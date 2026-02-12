@@ -8,7 +8,7 @@ mod windows_native;
 pub(crate) use windows_native::PlatformResolver;
 
 #[cfg(target_os = "linux")]
-mod linux_emulation;
+pub mod linux_emulation;
 #[cfg(target_os = "linux")]
 pub(crate) use linux_emulation::PlatformResolver;
 

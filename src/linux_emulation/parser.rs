@@ -1,3 +1,8 @@
+#![allow(dead_code)]
+
+// TODO(linux): Wire parser helpers into the linux emulation resolver once
+// cache-backed path handling is implemented.
+
 use crate::common::types::ResolverStatus;
 
 include!(concat!(env!("OUT_DIR"), "/unicode15_1_upper.rs"));

@@ -8,7 +8,7 @@ fn key_simple_uppercase_basic() {
     assert_eq!(key_simple_uppercase("abcXYZ"), "ABCXYZ");
     assert_eq!(key_simple_uppercase("mañana"), "MAÑANA");
     assert_eq!(key_simple_uppercase("føø"), "FØØ");
-    assert_eq!(key_simple_uppercase("ß"), "ẞ");
+    assert_eq!(key_simple_uppercase("ß"), "ß");
 }
 
 #[test]
