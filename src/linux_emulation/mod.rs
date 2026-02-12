@@ -1,5 +1,5 @@
 mod resolver;
-mod parser;
+pub mod parser;
 mod dirindex;
 mod cache;
 
