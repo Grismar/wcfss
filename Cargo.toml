@@ -1,0 +1,13 @@
+[package]
+name = "wcfss"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_Security"] }

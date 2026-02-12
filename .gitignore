@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
+**/*.tmp
+**/*.swp
+
+# OS-specific
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Rust tooling
+.cargo/
+rust-toolchain
+rust-toolchain.toml
+
+# Build outputs
+*.dll
+*.exe
+*.pdb
+*.so
+*.dylib
+
+# Misc
+*.log
+*.bak
