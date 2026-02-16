@@ -66,7 +66,12 @@ pub struct ResolverStringView {
 #[derive(Copy, Clone)]
 pub struct ResolverPlan {
     pub size: u32,
-    pub reserved: [u64; 8],
+    pub status: ResolverStatus,
+    pub would_error: ResolverStatus,
+    pub flags: u32,
+    pub resolved_parent: ResolverStringView,
+    pub resolved_leaf: ResolverStringView,
+    pub reserved: [u64; 6],
 }
 
 #[repr(C)]
@@ -97,3 +102,7 @@ pub struct ResolverResolvedPath {
 }
 
 pub const RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY: u32 = 1 << 0;
+pub const RESOLVER_PLAN_TARGET_EXISTS: u32 = 1 << 0;
+pub const RESOLVER_PLAN_TARGET_IS_DIR: u32 = 1 << 1;
+pub const RESOLVER_PLAN_WOULD_CREATE: u32 = 1 << 2;
+pub const RESOLVER_PLAN_WOULD_TRUNCATE: u32 = 1 << 3;

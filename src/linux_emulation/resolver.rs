@@ -2,6 +2,7 @@ use crate::common::types::*;
 use crate::linux_emulation::parser;
 use crate::resolver::Resolver;
 
+use core::ffi::c_char;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -55,10 +56,11 @@ enum EntrySet {
     Ambiguous(Vec<String>),
 }
 
-fn insert_entry(map: &mut HashMap<String, EntrySet>, key: String, name: String) {
+fn insert_entry(map: &mut HashMap<String, EntrySet>, key: String, name: String) -> bool {
     match map.get_mut(&key) {
         None => {
             map.insert(key, EntrySet::Unique(name));
+            false
         }
         Some(EntrySet::Unique(existing)) => {
             if existing != &name {
@@ -66,6 +68,9 @@ fn insert_entry(map: &mut HashMap<String, EntrySet>, key: String, name: String) 
                 list.sort();
                 list.dedup();
                 *map.get_mut(&key).unwrap() = EntrySet::Ambiguous(list);
+                true
+            } else {
+                false
             }
         }
         Some(EntrySet::Ambiguous(list)) => {
@@ -74,6 +79,7 @@ fn insert_entry(map: &mut HashMap<String, EntrySet>, key: String, name: String) 
                 list.sort();
                 list.dedup();
             }
+            true
         }
     }
 }
@@ -94,7 +100,18 @@ fn build_dir_index(
         match std::str::from_utf8(name.as_bytes()) {
             Ok(valid) => {
                 let key = parser::key_simple_uppercase(valid);
-                insert_entry(&mut map, key, valid.to_string());
+                let collision = insert_entry(&mut map, key.clone(), valid.to_string());
+                if collision {
+                    trace(&format!(
+                        "DirIndex collision detected for key '{}'; entry='{}'.",
+                        key, valid
+                    ));
+                } else {
+                    trace(&format!(
+                        "DirIndex indexed entry '{}' with key '{}'.",
+                        valid, key
+                    ));
+                }
             }
             Err(_) => {
                 invalid_utf8_count += 1;
@@ -128,6 +145,53 @@ fn normalize_input(input: &str) -> (String, bool) {
         }
     }
     (normalized, had_backslash)
+}
+
+fn init_plan(plan: &mut ResolverPlan) {
+    plan.size = std::mem::size_of::<ResolverPlan>() as u32;
+    plan.status = ResolverStatus::Ok;
+    plan.would_error = ResolverStatus::Ok;
+    plan.flags = 0;
+    plan.resolved_parent = ResolverStringView {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    plan.resolved_leaf = ResolverStringView {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    plan.reserved = [0; 6];
+}
+
+fn write_string_view(value: &str, out: &mut ResolverStringView) -> Result<(), ResolverStatus> {
+    if value.is_empty() {
+        out.ptr = std::ptr::null();
+        out.len = 0;
+        return Ok(());
+    }
+    let bytes = value.as_bytes();
+    let ptr = unsafe { libc::malloc(bytes.len()) } as *mut u8;
+    if ptr.is_null() {
+        return Err(ResolverStatus::IoError);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+    }
+    out.ptr = ptr as *const c_char;
+    out.len = bytes.len();
+    Ok(())
+}
+
+fn set_plan_paths(plan: &mut ResolverPlan, resolved: &Path) -> Result<(), ResolverStatus> {
+    let parent = resolved.parent().unwrap_or(resolved);
+    let parent_str = parent.to_string_lossy();
+    let leaf_str = resolved
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "".into());
+    write_string_view(&parent_str, &mut plan.resolved_parent)?;
+    write_string_view(&leaf_str, &mut plan.resolved_leaf)?;
+    Ok(())
 }
 
 fn validate_base_dir(base_dir: &str) -> Result<PathBuf, ResolverStatus> {
@@ -253,6 +317,27 @@ fn resolve_path_no_cache(
         let (selected_name, selected_meta, missing_component) = match exact_meta {
             Ok(meta) => {
                 trace("Exact match found.");
+                trace("Checking for case-insensitive collisions after exact match.");
+                let index = build_dir_index(&current, strict_utf8)?;
+                let key = parser::key_simple_uppercase(component);
+                match index.get(&key) {
+                    None => {
+                        trace("DirIndex had no entry for exact-match key; proceeding.");
+                    }
+                    Some(EntrySet::Ambiguous(list)) => {
+                        trace(&format!(
+                            "DirIndex collision for exact match key '{}': {:?}",
+                            key, list
+                        ));
+                        return Err(ResolverStatus::Collision);
+                    }
+                    Some(EntrySet::Unique(actual)) => {
+                        trace(&format!(
+                            "DirIndex unique match for exact key '{}': '{}'",
+                            key, actual
+                        ));
+                    }
+                }
                 (component.to_string(), meta, false)
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -294,15 +379,24 @@ fn resolve_path_no_cache(
             let dev = selected_meta.dev();
             let ino = selected_meta.ino();
             if visited_symlinks.contains(&(dev, ino)) {
-                trace("Symlink cycle detected.");
+                trace(&format!(
+                    "Symlink cycle detected at dev={}, ino={}.",
+                    dev, ino
+                ));
                 return Err(ResolverStatus::TooManySymlinks);
             }
             if symlink_depth >= SYMLINK_DEPTH_LIMIT {
-                trace("Symlink depth limit exceeded.");
+                trace(&format!(
+                    "Symlink depth limit exceeded (limit={SYMLINK_DEPTH_LIMIT})."
+                ));
                 return Err(ResolverStatus::TooManySymlinks);
             }
             visited_symlinks.insert((dev, ino));
             symlink_depth += 1;
+            trace(&format!(
+                "Symlink visit recorded (depth={}, dev={}, ino={}).",
+                symlink_depth, dev, ino
+            ));
         }
 
         let is_last = idx + 1 == components.len();
@@ -443,8 +537,7 @@ impl Resolver for LinuxResolver {
             return ResolverStatus::InvalidPath;
         }
         let plan_out = plan_out.unwrap();
-        plan_out.size = std::mem::size_of::<ResolverPlan>() as u32;
-        plan_out.reserved = [0; 8];
+        init_plan(plan_out);
 
         match resolve_path_no_cache(&base_dir_path, &input_path, intent, self.strict_utf8) {
             Ok(info) => {
@@ -456,9 +549,35 @@ impl Resolver for LinuxResolver {
                     info.would_create,
                     info.would_truncate
                 ));
+                let mut flags = 0u32;
+                if info.target_exists {
+                    flags |= RESOLVER_PLAN_TARGET_EXISTS;
+                }
+                if info.target_is_dir {
+                    flags |= RESOLVER_PLAN_TARGET_IS_DIR;
+                }
+                if info.would_create {
+                    flags |= RESOLVER_PLAN_WOULD_CREATE;
+                }
+                if info.would_truncate {
+                    flags |= RESOLVER_PLAN_WOULD_TRUNCATE;
+                }
+                plan_out.flags = flags;
+                plan_out.status = ResolverStatus::Ok;
+                plan_out.would_error = ResolverStatus::Ok;
+                if let Err(status) = set_plan_paths(plan_out, &info.path) {
+                    plan_out.status = status;
+                    plan_out.would_error = status;
+                    return status;
+                }
                 ResolverStatus::Ok
             }
-            Err(status) => status,
+            Err(status) => {
+                trace(&format!("Plan failed with status {:?}", status));
+                plan_out.status = status;
+                plan_out.would_error = status;
+                status
+            }
         }
     }
 

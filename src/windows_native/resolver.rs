@@ -1,6 +1,7 @@
 use crate::common::types::*;
 use crate::resolver::Resolver;
 
+use core::ffi::c_char;
 use super::win32;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -179,6 +180,53 @@ fn resolve_path_for_intent(
     Ok(win32::join_path(&parent, &leaf_name))
 }
 
+fn init_plan(plan: &mut ResolverPlan) {
+    plan.size = std::mem::size_of::<ResolverPlan>() as u32;
+    plan.status = ResolverStatus::Ok;
+    plan.would_error = ResolverStatus::Ok;
+    plan.flags = 0;
+    plan.resolved_parent = ResolverStringView {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    plan.resolved_leaf = ResolverStringView {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    plan.reserved = [0; 6];
+}
+
+fn write_string_view(value: &str, out: &mut ResolverStringView) -> Result<(), ResolverStatus> {
+    if value.is_empty() {
+        out.ptr = std::ptr::null();
+        out.len = 0;
+        return Ok(());
+    }
+    let bytes = value.as_bytes();
+    let ptr = unsafe { libc::malloc(bytes.len()) } as *mut u8;
+    if ptr.is_null() {
+        return Err(ResolverStatus::IoError);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+    }
+    out.ptr = ptr as *const c_char;
+    out.len = bytes.len();
+    Ok(())
+}
+
+fn set_plan_paths(plan: &mut ResolverPlan, resolved: &Path) -> Result<(), ResolverStatus> {
+    let parent = resolved.parent().unwrap_or(resolved);
+    let parent_str = parent.to_string_lossy();
+    let leaf_str = resolved
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "".into());
+    write_string_view(&parent_str, &mut plan.resolved_parent)?;
+    write_string_view(&leaf_str, &mut plan.resolved_leaf)?;
+    Ok(())
+}
+
 fn write_resolved_path(
     path: &Path,
     out_resolved_path: *mut ResolverResolvedPath,
@@ -224,7 +272,7 @@ impl Resolver for WindowsResolver {
         base_dir: *const ResolverStringView,
         input_path: *const ResolverStringView,
         intent: ResolverIntent,
-        _out_plan: *mut ResolverPlan,
+        out_plan: *mut ResolverPlan,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         let base_dir = match unsafe { string_view_to_string(base_dir) } {
@@ -236,9 +284,77 @@ impl Resolver for WindowsResolver {
             Err(status) => return status,
         };
 
+        let plan_out = unsafe { out_plan.as_mut() };
+        if plan_out.is_none() {
+            return status_invalid_ptr();
+        }
+        let plan_out = plan_out.unwrap();
+        init_plan(plan_out);
+
         match resolve_path_for_intent(&base_dir, &input_path, intent) {
-            Ok(_) => ResolverStatus::Ok,
-            Err(status) => status,
+            Ok(path) => {
+                let meta = std::fs::metadata(&path);
+                let (target_exists, target_is_dir) = match meta {
+                    Ok(meta) => (true, meta.is_dir()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, false),
+                    Err(_) => return ResolverStatus::IoError,
+                };
+                let mut flags = 0u32;
+                if target_exists {
+                    flags |= RESOLVER_PLAN_TARGET_EXISTS;
+                }
+                if target_is_dir {
+                    flags |= RESOLVER_PLAN_TARGET_IS_DIR;
+                }
+                let mut would_create = false;
+                let mut would_truncate = false;
+                match intent {
+                    ResolverIntent::Read | ResolverIntent::StatExists => {}
+                    ResolverIntent::WriteTruncate => {
+                        if target_exists {
+                            would_truncate = true;
+                        } else {
+                            would_create = true;
+                        }
+                    }
+                    ResolverIntent::WriteAppend => {
+                        if !target_exists {
+                            would_create = true;
+                        }
+                    }
+                    ResolverIntent::CreateNew => {
+                        if !target_exists {
+                            would_create = true;
+                        }
+                    }
+                    ResolverIntent::Mkdirs => {
+                        if !target_exists {
+                            would_create = true;
+                        }
+                    }
+                    ResolverIntent::Rename => {}
+                }
+                if would_create {
+                    flags |= RESOLVER_PLAN_WOULD_CREATE;
+                }
+                if would_truncate {
+                    flags |= RESOLVER_PLAN_WOULD_TRUNCATE;
+                }
+                plan_out.flags = flags;
+                plan_out.status = ResolverStatus::Ok;
+                plan_out.would_error = ResolverStatus::Ok;
+                if let Err(status) = set_plan_paths(plan_out, &path) {
+                    plan_out.status = status;
+                    plan_out.would_error = status;
+                    return status;
+                }
+                ResolverStatus::Ok
+            }
+            Err(status) => {
+                plan_out.status = status;
+                plan_out.would_error = status;
+                status
+            }
         }
     }
 

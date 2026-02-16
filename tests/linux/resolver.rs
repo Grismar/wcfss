@@ -139,6 +139,58 @@ fn collision_detection_case_insensitive() {
 }
 
 #[test]
+fn collision_detection_exact_match() {
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("collision_exact");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    let first = temp.path.join("Bar.txt");
+    fs::write(&first, b"one").expect("create Bar.txt");
+
+    let second = temp.path.join("bar.TXT");
+    match fs::OpenOptions::new().create_new(true).write(true).open(&second) {
+        Ok(mut f) => {
+            f.write_all(b"two").unwrap();
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("collision exact test skipped: case-sensitive entries not supported");
+            return;
+        }
+        Err(err) => panic!("unexpected error creating second entry: {err}"),
+    }
+
+    let status = open_return_path(&resolver, &base, "Bar.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::Collision);
+}
+
+#[test]
+fn collision_detection_intermediate_component() {
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("collision_intermediate");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    let dir_a = temp.path.join("Dir");
+    let dir_b = temp.path.join("dir");
+    fs::create_dir_all(&dir_a).expect("create Dir");
+    match fs::create_dir_all(&dir_b) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("collision intermediate test skipped: case-sensitive entries not supported");
+            return;
+        }
+        Err(err) => panic!("unexpected error creating second directory: {err}"),
+    }
+    fs::write(dir_a.join("file.txt"), b"data").expect("write file");
+
+    let status = open_return_path(&resolver, &base, "DIR/file.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::Collision);
+}
+
+#[test]
 fn symlink_cycle_detection() {
     let resolver = TestResolver::new(0);
     let temp = TempDir::new("symlink_loop");
@@ -149,6 +201,25 @@ fn symlink_cycle_detection() {
     symlink("loop", &loop_path).expect("create symlink loop");
 
     let status = open_return_path(&resolver, &base, "loop/file.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::TooManySymlinks);
+}
+
+#[test]
+fn symlink_cycle_detection_revisit() {
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("symlink_revisit");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    let file_path = temp.path.join("file.txt");
+    fs::write(&file_path, b"data").expect("write file");
+
+    let loop_path = temp.path.join("loop");
+    #[cfg(target_os = "linux")]
+    symlink(".", &loop_path).expect("create symlink to self directory");
+
+    let status = open_return_path(&resolver, &base, "loop/loop/file.txt", ResolverIntent::Read)
         .err()
         .unwrap_or(ResolverStatus::Ok);
     assert_eq!(status, ResolverStatus::TooManySymlinks);
