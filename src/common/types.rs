@@ -95,3 +95,5 @@ pub struct ResolverMetrics {
 pub struct ResolverResolvedPath {
     pub value: ResolverStringView,
 }
+
+pub const RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY: u32 = 1 << 0;

@@ -89,7 +89,10 @@ pub fn parse_path_str(input: &str) -> Result<ParsedPath, ResolverStatus> {
 }
 
 fn root_is_absolute(root: &RootKind) -> bool {
-    matches!(root, RootKind::PosixRoot | RootKind::Drive(_) | RootKind::Unc { .. })
+    matches!(
+        root,
+        RootKind::PosixRoot | RootKind::Drive(_) | RootKind::Unc { .. }
+    )
 }
 
 fn parse_root(input: &str) -> Result<(RootKind, &str), ResolverStatus> {

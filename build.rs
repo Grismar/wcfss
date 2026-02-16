@@ -31,8 +31,7 @@ fn main() {
         }
 
         if let Some(upper_hex) = simple_upper {
-            let upper =
-                u32::from_str_radix(upper_hex, 16).expect("parse simple uppercase mapping");
+            let upper = u32::from_str_radix(upper_hex, 16).expect("parse simple uppercase mapping");
             map[code as usize] = upper;
         }
     }
@@ -41,11 +40,8 @@ fn main() {
     let dest = out_dir.join("unicode15_1_upper.rs");
     let mut out = File::create(&dest).expect("create unicode15_1_upper.rs");
 
-    writeln!(
-        out,
-        "pub static SIMPLE_UPPERCASE_MAP: [u32; 0x110000] = ["
-    )
-    .expect("write map header");
+    writeln!(out, "pub static SIMPLE_UPPERCASE_MAP: [u32; 0x110000] = [")
+        .expect("write map header");
 
     for (i, value) in map.iter().enumerate() {
         if i % 8 == 0 {

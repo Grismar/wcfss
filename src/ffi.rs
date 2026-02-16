@@ -57,7 +57,9 @@ pub extern "C" fn resolver_plan(
     // TODO(ffi): validate pointers and sizes for out_plan/out_diag.
     let handle = unsafe { handle.as_ref() };
     match handle {
-        Some(h) => h.inner.plan(base_dir, input_path, intent, out_plan, out_diag),
+        Some(h) => h
+            .inner
+            .plan(base_dir, input_path, intent, out_plan, out_diag),
         None => status_invalid_handle(),
     }
 }
@@ -73,7 +75,9 @@ pub extern "C" fn resolver_execute_mkdirs(
     // TODO(ffi): validate pointers and sizes for out_result/out_diag.
     let handle = unsafe { handle.as_ref() };
     match handle {
-        Some(h) => h.inner.execute_mkdirs(base_dir, input_path, out_result, out_diag),
+        Some(h) => h
+            .inner
+            .execute_mkdirs(base_dir, input_path, out_result, out_diag),
         None => status_invalid_handle(),
     }
 }

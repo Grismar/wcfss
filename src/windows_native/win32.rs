@@ -3,18 +3,17 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{
-    BOOL, HANDLE, INVALID_HANDLE_VALUE, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
-    ERROR_BAD_PATHNAME, ERROR_DIRECTORY, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
-    ERROR_FILENAME_EXCED_RANGE, ERROR_INVALID_NAME, ERROR_PATH_NOT_FOUND,
-    ERROR_SHARING_VIOLATION,
+    BOOL, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BAD_PATHNAME, ERROR_DIRECTORY,
+    ERROR_FILENAME_EXCED_RANGE, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
+    ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, DeleteFileW, FindClose, FindFirstFileW, FindNextFileW,
-    GetFileAttributesW, MoveFileExW, WIN32_FIND_DATAW, INVALID_FILE_ATTRIBUTES,
-    FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    MOVEFILE_REPLACE_EXISTING, OPEN_ALWAYS, OPEN_EXISTING, CREATE_ALWAYS, CREATE_NEW,
-    FILE_APPEND_DATA, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    GetFileAttributesW, MoveFileExW, CREATE_ALWAYS, CREATE_NEW, FILE_APPEND_DATA,
+    FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
+    OPEN_ALWAYS, OPEN_EXISTING, WIN32_FIND_DATAW,
 };
 
 use crate::common::types::ResolverStatus;
@@ -69,7 +68,9 @@ pub fn get_file_attributes(path: &Path) -> Result<u32, ResolverStatus> {
     let wide = os_str_to_wide(path.as_os_str());
     let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
     if attrs == INVALID_FILE_ATTRIBUTES {
-        return Err(map_win32_error(unsafe { windows_sys::Win32::Foundation::GetLastError() }));
+        return Err(map_win32_error(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
     }
     Ok(attrs)
 }
@@ -82,7 +83,9 @@ pub fn find_match(dir: &Path, target: &OsStr) -> Result<MatchResult, ResolverSta
     let mut find_data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
     let handle = unsafe { FindFirstFileW(pattern_wide.as_ptr(), &mut find_data) };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(map_win32_error(unsafe { windows_sys::Win32::Foundation::GetLastError() }));
+        return Err(map_win32_error(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
     }
 
     let target_wide: Vec<u16> = target.encode_wide().collect();
@@ -123,7 +126,9 @@ pub fn create_directory(path: &Path) -> Result<(), ResolverStatus> {
     let wide = os_str_to_wide(path.as_os_str());
     let ok = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
     if ok == 0 {
-        return Err(map_win32_error(unsafe { windows_sys::Win32::Foundation::GetLastError() }));
+        return Err(map_win32_error(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
     }
     Ok(())
 }
@@ -132,7 +137,9 @@ pub fn delete_file(path: &Path) -> Result<(), ResolverStatus> {
     let wide = os_str_to_wide(path.as_os_str());
     let ok = unsafe { DeleteFileW(wide.as_ptr()) };
     if ok == 0 {
-        return Err(map_win32_error(unsafe { windows_sys::Win32::Foundation::GetLastError() }));
+        return Err(map_win32_error(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
     }
     Ok(())
 }
@@ -140,9 +147,17 @@ pub fn delete_file(path: &Path) -> Result<(), ResolverStatus> {
 pub fn move_file_replace(src: &Path, dst: &Path) -> Result<(), ResolverStatus> {
     let src_wide = os_str_to_wide(src.as_os_str());
     let dst_wide = os_str_to_wide(dst.as_os_str());
-    let ok = unsafe { MoveFileExW(src_wide.as_ptr(), dst_wide.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+    let ok = unsafe {
+        MoveFileExW(
+            src_wide.as_ptr(),
+            dst_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    };
     if ok == 0 {
-        return Err(map_win32_error(unsafe { windows_sys::Win32::Foundation::GetLastError() }));
+        return Err(map_win32_error(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
     }
     Ok(())
 }
@@ -169,7 +184,9 @@ pub fn open_file(path: &Path, intent: OpenIntent) -> Result<HANDLE, ResolverStat
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(map_win32_error(unsafe { windows_sys::Win32::Foundation::GetLastError() }));
+        return Err(map_win32_error(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
     }
     Ok(handle)
 }

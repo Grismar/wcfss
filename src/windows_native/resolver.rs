@@ -1,9 +1,9 @@
 use crate::common::types::*;
 use crate::resolver::Resolver;
 
+use super::win32;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use super::win32;
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 
@@ -106,9 +106,7 @@ fn resolve_intermediate(
         if match_result.count > 1 {
             return Err(ResolverStatus::Collision);
         }
-        let name = match_result
-            .unique_name
-            .ok_or(ResolverStatus::NotFound)?;
+        let name = match_result.unique_name.ok_or(ResolverStatus::NotFound)?;
         if (match_result.unique_attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
             return Err(ResolverStatus::NotADirectory);
         }
@@ -130,9 +128,7 @@ fn resolve_final(
         if intent == ResolverIntent::CreateNew {
             return Err(ResolverStatus::Exists);
         }
-        return Ok(match_result
-            .unique_name
-            .unwrap_or_else(|| leaf.clone()));
+        return Ok(match_result.unique_name.unwrap_or_else(|| leaf.clone()));
     }
 
     if is_create_intent(intent) || intent == ResolverIntent::Mkdirs {
@@ -183,7 +179,10 @@ fn resolve_path_for_intent(
     Ok(win32::join_path(&parent, &leaf_name))
 }
 
-fn write_resolved_path(path: &Path, out_resolved_path: *mut ResolverResolvedPath) -> ResolverStatus {
+fn write_resolved_path(
+    path: &Path,
+    out_resolved_path: *mut ResolverResolvedPath,
+) -> ResolverStatus {
     let out_resolved_path = unsafe { out_resolved_path.as_mut() };
     let out_resolved_path = match out_resolved_path {
         Some(out) => out,
