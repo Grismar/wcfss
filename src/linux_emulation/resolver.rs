@@ -533,11 +533,6 @@ impl Resolver for LinuxResolver {
         };
 
         let plan_out = unsafe { out_plan.as_mut() };
-        if plan_out.is_none() {
-            return ResolverStatus::InvalidPath;
-        }
-        let plan_out = plan_out.unwrap();
-        init_plan(plan_out);
 
         match resolve_path_no_cache(&base_dir_path, &input_path, intent, self.strict_utf8) {
             Ok(info) => {
@@ -562,20 +557,26 @@ impl Resolver for LinuxResolver {
                 if info.would_truncate {
                     flags |= RESOLVER_PLAN_WOULD_TRUNCATE;
                 }
-                plan_out.flags = flags;
-                plan_out.status = ResolverStatus::Ok;
-                plan_out.would_error = ResolverStatus::Ok;
-                if let Err(status) = set_plan_paths(plan_out, &info.path) {
-                    plan_out.status = status;
-                    plan_out.would_error = status;
-                    return status;
+                if let Some(plan_out) = plan_out {
+                    init_plan(plan_out);
+                    plan_out.flags = flags;
+                    plan_out.status = ResolverStatus::Ok;
+                    plan_out.would_error = ResolverStatus::Ok;
+                    if let Err(status) = set_plan_paths(plan_out, &info.path) {
+                        plan_out.status = status;
+                        plan_out.would_error = status;
+                        return status;
+                    }
                 }
                 ResolverStatus::Ok
             }
             Err(status) => {
                 trace(&format!("Plan failed with status {:?}", status));
-                plan_out.status = status;
-                plan_out.would_error = status;
+                if let Some(plan_out) = plan_out {
+                    init_plan(plan_out);
+                    plan_out.status = status;
+                    plan_out.would_error = status;
+                }
                 status
             }
         }
