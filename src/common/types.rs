@@ -71,6 +71,7 @@ pub struct ResolverPlan {
     pub flags: u32,
     pub resolved_parent: ResolverStringView,
     pub resolved_leaf: ResolverStringView,
+    // TODO(spec): add plan token fields (generations, dir generations, stamps).
     pub reserved: [u64; 6],
 }
 

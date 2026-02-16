@@ -576,7 +576,7 @@ impl Resolver for WindowsResolver {
         _out_result: *mut ResolverResult,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        // TODO(windows): implement execute-from-plan.
+        // TODO(windows): implement execute-from-plan with plan token validation.
         ResolverStatus::IoError
     }
 

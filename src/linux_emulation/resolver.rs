@@ -66,6 +66,7 @@ fn build_dir_index(
     let meta = fs::metadata(dir).map_err(|err| map_io_error(&err))?;
     let dir_id = (meta.dev(), meta.ino());
     let stamp = DirStamp::from_meta(&meta);
+    let diag_path = dir.to_string_lossy().into_owned();
     let entries = fs::read_dir(dir).map_err(|err| map_io_error(&err))?;
     let mut invalid_utf8_count = 0usize;
     let mut entry_count = 0usize;
@@ -112,6 +113,7 @@ fn build_dir_index(
     ));
     Ok(DirIndex {
         dir_id,
+        diag_path,
         fold_map: map,
         stamp,
         built_at: Instant::now(),
@@ -352,6 +354,7 @@ fn resolve_path(
                             "DirIndex collision for exact match key '{}': {:?}",
                             key, list
                         ));
+                        // TODO(diagnostics): include collision payload (dir path, component, names).
                         return Err(ResolverStatus::Collision);
                     }
                     Some(EntrySet::Unique(actual)) => {
@@ -380,6 +383,7 @@ fn resolve_path(
                     }
                     Some(EntrySet::Ambiguous(list)) => {
                         trace(&format!("DirIndex collision for key '{}': {:?}", key, list));
+                        // TODO(diagnostics): include collision payload (dir path, component, names).
                         return Err(ResolverStatus::Collision);
                     }
                     Some(EntrySet::Unique(actual)) => {
@@ -512,7 +516,8 @@ pub struct LinuxResolver {
     cache_generation: Cell<u64>,
 }
 
-// Single-threaded assumption for now; caller must not share across threads.
+// Safety: LinuxResolver uses interior mutability and is not synchronized.
+// The caller must not share a single instance across threads until locks are added.
 unsafe impl Send for LinuxResolver {}
 unsafe impl Sync for LinuxResolver {}
 
@@ -532,6 +537,7 @@ impl LinuxResolver {
         };
         let cache_generation = combine_generations(generations);
         let ttl_fast = parse_ttl_fast();
+        // TODO(spec): ttl_fast should be configurable per resolver instance.
         Self {
             strict_utf8,
             ttl_fast,
@@ -725,6 +731,8 @@ impl Resolver for LinuxResolver {
         if let Err(err) = fs::create_dir_all(&info.path) {
             return map_io_error(&err);
         }
+        // TODO(cache): invalidate only affected directories once per-directory generation exists.
+        self.cache.borrow_mut().clear();
         ResolverStatus::Ok
     }
 
@@ -780,6 +788,8 @@ impl Resolver for LinuxResolver {
         if let Err(err) = fs::remove_file(&info.path) {
             return map_io_error(&err);
         }
+        // TODO(cache): invalidate only affected directories once per-directory generation exists.
+        self.cache.borrow_mut().clear();
         ResolverStatus::Ok
     }
 
@@ -880,6 +890,13 @@ impl Resolver for LinuxResolver {
             let err = io::Error::last_os_error();
             return map_io_error(&err);
         }
+        if matches!(
+            intent,
+            ResolverIntent::WriteAppend | ResolverIntent::WriteTruncate | ResolverIntent::CreateNew
+        ) {
+            // TODO(cache): invalidate only affected directories once per-directory generation exists.
+            self.cache.borrow_mut().clear();
+        }
         unsafe {
             *out_fd = fd;
         }
@@ -892,7 +909,7 @@ impl Resolver for LinuxResolver {
         _out_result: *mut ResolverResult,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        // TODO(linux): validate plan token and execute.
+        // TODO(linux): validate plan token (generations + dir generations) and execute.
         ResolverStatus::IoError
     }
 
