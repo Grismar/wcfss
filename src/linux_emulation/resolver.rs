@@ -1,12 +1,16 @@
 use crate::common::types::*;
+use crate::linux_emulation::cache::DirIndexCache;
+use crate::linux_emulation::dirindex::{DirIndex, DirStamp, EntrySet};
 use crate::linux_emulation::parser;
 use crate::resolver::Resolver;
 
 use core::ffi::c_char;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -15,6 +19,8 @@ const MAX_INPUT_PATH_BYTES: usize = 32 * 1024;
 const MAX_COMPONENTS: usize = 4096;
 const MAX_COMPONENT_BYTES: usize = 255;
 const SYMLINK_DEPTH_LIMIT: usize = 40;
+const DEFAULT_TTL_FAST_MS: u64 = 1000;
+const DEFAULT_CACHE_MAX_ENTRIES: usize = 1000;
 fn trace(msg: &str) {
     eprintln!("[wcfss][linux] {msg}");
 }
@@ -50,46 +56,16 @@ fn string_view_to_string(view: *const ResolverStringView) -> Result<String, Reso
         .map_err(|_| ResolverStatus::EncodingError)
 }
 
-#[derive(Debug)]
-enum EntrySet {
-    Unique(String),
-    Ambiguous(Vec<String>),
-}
-
-fn insert_entry(map: &mut HashMap<String, EntrySet>, key: String, name: String) -> bool {
-    match map.get_mut(&key) {
-        None => {
-            map.insert(key, EntrySet::Unique(name));
-            false
-        }
-        Some(EntrySet::Unique(existing)) => {
-            if existing != &name {
-                let mut list = vec![existing.clone(), name];
-                list.sort();
-                list.dedup();
-                *map.get_mut(&key).unwrap() = EntrySet::Ambiguous(list);
-                true
-            } else {
-                false
-            }
-        }
-        Some(EntrySet::Ambiguous(list)) => {
-            if !list.iter().any(|entry| entry == &name) {
-                list.push(name);
-                list.sort();
-                list.dedup();
-            }
-            true
-        }
-    }
-}
-
 fn build_dir_index(
     dir: &Path,
     strict_utf8: bool,
-) -> Result<HashMap<String, EntrySet>, ResolverStatus> {
+    dir_index_generation: u64,
+) -> Result<DirIndex, ResolverStatus> {
     trace(&format!("DirIndex build start: {}", dir.display()));
     let mut map: HashMap<String, EntrySet> = HashMap::new();
+    let meta = fs::metadata(dir).map_err(|err| map_io_error(&err))?;
+    let dir_id = (meta.dev(), meta.ino());
+    let stamp = DirStamp::from_meta(&meta);
     let entries = fs::read_dir(dir).map_err(|err| map_io_error(&err))?;
     let mut invalid_utf8_count = 0usize;
     let mut entry_count = 0usize;
@@ -100,7 +76,11 @@ fn build_dir_index(
         match std::str::from_utf8(name.as_bytes()) {
             Ok(valid) => {
                 let key = parser::key_simple_uppercase(valid);
-                let collision = insert_entry(&mut map, key.clone(), valid.to_string());
+                let collision = crate::linux_emulation::dirindex::insert_entry(
+                    &mut map,
+                    key.clone(),
+                    valid.to_string(),
+                );
                 if collision {
                     trace(&format!(
                         "DirIndex collision detected for key '{}'; entry='{}'.",
@@ -130,7 +110,13 @@ fn build_dir_index(
         "DirIndex build complete: {} entries ({} invalid UTF-8 skipped)",
         entry_count, invalid_utf8_count
     ));
-    Ok(map)
+    Ok(DirIndex {
+        dir_id,
+        fold_map: map,
+        stamp,
+        built_at: Instant::now(),
+        dir_index_generation,
+    })
 }
 
 fn normalize_input(input: &str) -> (String, bool) {
@@ -194,6 +180,32 @@ fn set_plan_paths(plan: &mut ResolverPlan, resolved: &Path) -> Result<(), Resolv
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResolverGenerations {
+    unicode_version_generation: u64,
+    root_mapping_generation: u64,
+    absolute_path_support_generation: u64,
+    encoding_policy_generation: u64,
+    symlink_policy_generation: u64,
+}
+
+fn combine_generations(gen: ResolverGenerations) -> u64 {
+    let mut value = 0u64;
+    let parts = [
+        gen.unicode_version_generation,
+        gen.root_mapping_generation,
+        gen.absolute_path_support_generation,
+        gen.encoding_policy_generation,
+        gen.symlink_policy_generation,
+    ];
+    for part in parts {
+        value = value
+            .wrapping_mul(1_000_003)
+            .wrapping_add(part.wrapping_add(0x9e37_79b9_7f4a_7c15));
+    }
+    value
+}
+
 fn validate_base_dir(base_dir: &str) -> Result<PathBuf, ResolverStatus> {
     if !base_dir.starts_with('/') {
         return Err(ResolverStatus::BaseDirInvalid);
@@ -243,11 +255,22 @@ struct ResolvedInfo {
     would_truncate: bool,
 }
 
-fn resolve_path_no_cache(
+fn parse_ttl_fast() -> Duration {
+    match std::env::var("WCFSS_TTL_FAST_MS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(DEFAULT_TTL_FAST_MS)),
+        Err(_) => Duration::from_millis(DEFAULT_TTL_FAST_MS),
+    }
+}
+
+fn resolve_path(
+    resolver: &LinuxResolver,
     base_dir: &Path,
     input_path: &str,
     intent: ResolverIntent,
-    strict_utf8: bool,
 ) -> Result<ResolvedInfo, ResolverStatus> {
     if input_path.as_bytes().len() > MAX_INPUT_PATH_BYTES {
         return Err(ResolverStatus::PathTooLong);
@@ -318,9 +341,9 @@ fn resolve_path_no_cache(
             Ok(meta) => {
                 trace("Exact match found.");
                 trace("Checking for case-insensitive collisions after exact match.");
-                let index = build_dir_index(&current, strict_utf8)?;
+                let index = resolver.get_dir_index(&current)?;
                 let key = parser::key_simple_uppercase(component);
-                match index.get(&key) {
+                match index.fold_map.get(&key) {
                     None => {
                         trace("DirIndex had no entry for exact-match key; proceeding.");
                     }
@@ -342,9 +365,9 @@ fn resolve_path_no_cache(
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 trace("Exact match not found; building temporary DirIndex.");
-                let index = build_dir_index(&current, strict_utf8)?;
+                let index = resolver.get_dir_index(&current)?;
                 let key = parser::key_simple_uppercase(component);
-                match index.get(&key) {
+                match index.fold_map.get(&key) {
                     None => {
                         trace("DirIndex had no match for component.");
                         if intent == ResolverIntent::Mkdirs {
@@ -483,7 +506,15 @@ fn resolve_path_no_cache(
 
 pub struct LinuxResolver {
     strict_utf8: bool,
+    ttl_fast: Duration,
+    cache: RefCell<DirIndexCache>,
+    generations: Cell<ResolverGenerations>,
+    cache_generation: Cell<u64>,
 }
+
+// Single-threaded assumption for now; caller must not share across threads.
+unsafe impl Send for LinuxResolver {}
+unsafe impl Sync for LinuxResolver {}
 
 impl LinuxResolver {
     pub fn new(config: *const ResolverConfig) -> Self {
@@ -491,18 +522,89 @@ impl LinuxResolver {
         let strict_utf8 = unsafe { config.as_ref() }
             .map(|cfg| cfg.flags & RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY != 0)
             .unwrap_or(false);
-        Self { strict_utf8 }
+        let encoding_policy_generation = if strict_utf8 { 1 } else { 0 };
+        let generations = ResolverGenerations {
+            unicode_version_generation: 1,
+            root_mapping_generation: 0,
+            absolute_path_support_generation: 0,
+            encoding_policy_generation,
+            symlink_policy_generation: 0,
+        };
+        let cache_generation = combine_generations(generations);
+        let ttl_fast = parse_ttl_fast();
+        Self {
+            strict_utf8,
+            ttl_fast,
+            cache: RefCell::new(DirIndexCache::new(DEFAULT_CACHE_MAX_ENTRIES)),
+            generations: Cell::new(generations),
+            cache_generation: Cell::new(cache_generation),
+        }
+    }
+
+    fn current_dir_index_generation(&self) -> u64 {
+        combine_generations(self.generations.get())
+    }
+
+    fn invalidate_cache_if_needed(&self) {
+        let current = self.current_dir_index_generation();
+        if self.cache_generation.get() != current {
+            trace("DirIndex generation changed; clearing cache.");
+            self.cache.borrow_mut().clear();
+            self.cache_generation.set(current);
+        }
+    }
+
+    fn get_dir_index(&self, dir: &Path) -> Result<DirIndex, ResolverStatus> {
+        self.invalidate_cache_if_needed();
+        let meta = fs::metadata(dir).map_err(|err| map_io_error(&err))?;
+        let dir_id = (meta.dev(), meta.ino());
+        let stamp = DirStamp::from_meta(&meta);
+        let now = Instant::now();
+
+        {
+            let mut cache = self.cache.borrow_mut();
+            if let Some(entry) = cache.get_mut(&dir_id) {
+                let age = now.duration_since(entry.built_at);
+                if age < self.ttl_fast {
+                    trace(&format!(
+                        "DirIndex cache hit (ttl_fast, age {:?}).",
+                        age
+                    ));
+                    return Ok(entry.clone());
+                }
+                if entry.stamp.matches(&stamp) {
+                    trace("DirIndex cache hit (stamp match); refreshing built_at.");
+                    entry.built_at = now;
+                    return Ok(entry.clone());
+                }
+                trace("DirIndex cache stale; rebuilding.");
+            } else {
+                trace("DirIndex cache miss; building.");
+            }
+        }
+
+        let index = build_dir_index(dir, self.strict_utf8, self.current_dir_index_generation())?;
+        let mut cache = self.cache.borrow_mut();
+        cache.insert(index.clone());
+        Ok(index)
     }
 }
 
 impl Resolver for LinuxResolver {
     fn set_root_mapping(
         &self,
-        _mapping: *const ResolverRootMapping,
+        mapping: *const ResolverRootMapping,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        // TODO(linux): update root mapping table and generations.
-        ResolverStatus::UnsupportedAbsolutePath
+        let mapping = unsafe { mapping.as_ref() };
+        if mapping.is_none() {
+            return ResolverStatus::InvalidPath;
+        }
+        let mut generations = self.generations.get();
+        generations.root_mapping_generation = generations.root_mapping_generation.wrapping_add(1);
+        self.generations.set(generations);
+        self.invalidate_cache_if_needed();
+        ResolverStatus::Ok
     }
 
     fn plan(
@@ -534,7 +636,7 @@ impl Resolver for LinuxResolver {
 
         let plan_out = unsafe { out_plan.as_mut() };
 
-        match resolve_path_no_cache(&base_dir_path, &input_path, intent, self.strict_utf8) {
+        match resolve_path(self, &base_dir_path, &input_path, intent) {
             Ok(info) => {
                 trace(&format!(
                     "Plan resolved: path='{}', exists={}, is_dir={}, would_create={}, would_truncate={}",
@@ -607,12 +709,7 @@ impl Resolver for LinuxResolver {
             out.reserved = [0; 6];
         }
 
-        let info = match resolve_path_no_cache(
-            &base_dir_path,
-            &input_path,
-            ResolverIntent::Mkdirs,
-            self.strict_utf8,
-        ) {
+        let info = match resolve_path(self, &base_dir_path, &input_path, ResolverIntent::Mkdirs) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -668,12 +765,7 @@ impl Resolver for LinuxResolver {
             out.reserved = [0; 6];
         }
 
-        let info = match resolve_path_no_cache(
-            &base_dir_path,
-            &input_path,
-            ResolverIntent::Read,
-            self.strict_utf8,
-        ) {
+        let info = match resolve_path(self, &base_dir_path, &input_path, ResolverIntent::Read) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -712,12 +804,7 @@ impl Resolver for LinuxResolver {
             Err(status) => return status,
         };
 
-        let info = match resolve_path_no_cache(
-            &base_dir_path,
-            &input_path,
-            intent,
-            self.strict_utf8,
-        ) {
+        let info = match resolve_path(self, &base_dir_path, &input_path, intent) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -771,12 +858,7 @@ impl Resolver for LinuxResolver {
             Err(status) => return status,
         };
 
-        let info = match resolve_path_no_cache(
-            &base_dir_path,
-            &input_path,
-            intent,
-            self.strict_utf8,
-        ) {
+        let info = match resolve_path(self, &base_dir_path, &input_path, intent) {
             Ok(value) => value,
             Err(status) => return status,
         };

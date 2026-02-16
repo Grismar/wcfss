@@ -96,6 +96,14 @@ fn open_return_path(
     Ok(value)
 }
 
+fn bump_root_mapping_generation(resolver: &TestResolver) -> ResolverStatus {
+    let mapping = ResolverRootMapping {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    resolver_set_root_mapping(resolver.handle, &mapping, std::ptr::null_mut())
+}
+
 fn assert_path_ends_with(resolved: &str, tail: &Path) {
     let resolved_path = Path::new(resolved);
     assert!(
@@ -223,6 +231,77 @@ fn symlink_cycle_detection_revisit() {
         .err()
         .unwrap_or(ResolverStatus::Ok);
     assert_eq!(status, ResolverStatus::TooManySymlinks);
+}
+
+#[test]
+fn dirindex_ttl_refresh_detects_changes() {
+    std::env::set_var("WCFSS_TTL_FAST_MS", "1000");
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("ttl_refresh");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    let first = temp.path.join("Ttl.txt");
+    fs::write(&first, b"one").expect("create Ttl.txt");
+    let resolved = open_return_path(&resolver, &base, "Ttl.txt", ResolverIntent::Read)
+        .expect("resolve before collision");
+    assert_path_ends_with(&resolved, Path::new("Ttl.txt"));
+
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let second = temp.path.join("ttl.TXT");
+    match fs::OpenOptions::new().create_new(true).write(true).open(&second) {
+        Ok(mut f) => {
+            f.write_all(b"two").unwrap();
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("ttl test skipped: case-sensitive entries not supported");
+            return;
+        }
+        Err(err) => panic!("unexpected error creating second entry: {err}"),
+    }
+
+    let status = open_return_path(&resolver, &base, "Ttl.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::Collision);
+}
+
+#[test]
+fn dirindex_generation_invalidation_clears_cache() {
+    std::env::set_var("WCFSS_TTL_FAST_MS", "10_000");
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("generation_invalidate");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    let first = temp.path.join("Gen.txt");
+    fs::write(&first, b"one").expect("create Gen.txt");
+    let resolved = open_return_path(&resolver, &base, "Gen.txt", ResolverIntent::Read)
+        .expect("resolve before collision");
+    assert_path_ends_with(&resolved, Path::new("Gen.txt"));
+
+    let second = temp.path.join("gen.TXT");
+    match fs::OpenOptions::new().create_new(true).write(true).open(&second) {
+        Ok(mut f) => {
+            f.write_all(b"two").unwrap();
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("generation test skipped: case-sensitive entries not supported");
+            return;
+        }
+        Err(err) => panic!("unexpected error creating second entry: {err}"),
+    }
+
+    let status = open_return_path(&resolver, &base, "Gen.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let bump_status = bump_root_mapping_generation(&resolver);
+    assert_eq!(bump_status, ResolverStatus::Ok);
+
+    let status = open_return_path(&resolver, &base, "Gen.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::Collision);
 }
 
 #[test]
