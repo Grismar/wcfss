@@ -414,95 +414,111 @@ fn resolve_path_for_intent(
     mut diag: Option<&mut DiagCollector>,
     mut plan_trace: Option<&mut PlanTrace>,
 ) -> Result<PathBuf, ResolverStatus> {
+    let normalized_input = input_path.replace('/', "\\");
+    let absolute_input = Path::new(&normalized_input).is_absolute();
     let (start, components) = resolve_base_and_components(base_dir, input_path)?;
-    if components.is_empty() {
-        if let Some(plan_trace) = plan_trace.as_deref_mut() {
-            resolver.record_dir_generation_for_path(&start, plan_trace);
-        }
-        return Ok(start);
-    }
-
-    let mut current = start;
-    let mut stack: Vec<(PathBuf, bool)> = vec![(current.clone(), false)];
-    for (idx, component) in components.iter().enumerate() {
-        match component {
-            ParsedComponent::Parent => {
-                if stack.len() <= 1 {
-                    return Err(ResolverStatus::EscapesRoot);
-                }
-                let (_, was_symlink) = stack.pop().unwrap();
-                if was_symlink {
-                    if let Some(diag) = diag.as_deref_mut() {
-                        diag.push(
-                            ResolverDiagCode::SymlinkLoop,
-                            ResolverDiagSeverity::Error,
-                            current.display().to_string(),
-                            "path traversed across symlink boundary".to_string(),
-                        );
-                    }
-                    return Err(ResolverStatus::InvalidPath);
-                }
-                current = stack.last().unwrap().0.clone();
+    let result = (|| {
+        if components.is_empty() {
+            if let Some(plan_trace) = plan_trace.as_deref_mut() {
+                resolver.record_dir_generation_for_path(&start, plan_trace);
             }
-            ParsedComponent::Normal(name) => {
-                let is_last = idx + 1 == components.len();
-                if is_last {
-                    let leaf_name = resolve_final(
-                        resolver,
-                        &current,
-                        name,
-                        intent,
-                        diag.as_deref_mut(),
-                        plan_trace.as_deref_mut(),
-                    )?;
-                    return Ok(win32::join_path(&current, &leaf_name));
-                }
-                if let Some(plan_trace) = plan_trace.as_deref_mut() {
-                    resolver.record_dir_generation_for_path(&current, plan_trace);
-                }
-                let match_result = match win32::find_match(&current, name) {
-                    Ok(value) => value,
-                    Err(status) => {
-                        if status == ResolverStatus::PermissionDenied {
-                            if let Some(diag) = diag.as_deref_mut() {
-                                diag.push(
-                                    ResolverDiagCode::PermissionDenied,
-                                    ResolverDiagSeverity::Error,
-                                    current.display().to_string(),
-                                    "permission denied listing directory".to_string(),
-                                );
-                            }
+            return Ok(start);
+        }
+
+        let mut current = start;
+        let mut stack: Vec<(PathBuf, bool)> = vec![(current.clone(), false)];
+        for (idx, component) in components.iter().enumerate() {
+            match component {
+                ParsedComponent::Parent => {
+                    if stack.len() <= 1 {
+                        return Err(ResolverStatus::EscapesRoot);
+                    }
+                    let (_, was_symlink) = stack.pop().unwrap();
+                    if was_symlink {
+                        if let Some(diag) = diag.as_deref_mut() {
+                            diag.push(
+                                ResolverDiagCode::SymlinkLoop,
+                                ResolverDiagSeverity::Error,
+                                current.display().to_string(),
+                                "path traversed across symlink boundary".to_string(),
+                            );
                         }
-                        return Err(status);
+                        return Err(ResolverStatus::InvalidPath);
                     }
-                };
-                if match_result.count == 0 {
-                    return Err(ResolverStatus::NotFound);
+                    current = stack.last().unwrap().0.clone();
                 }
-                if match_result.count > 1 {
-                    resolver.metrics.collisions.fetch_add(1, Ordering::SeqCst);
-                    if let Some(diag) = diag.as_deref_mut() {
-                        diag.push(
-                            ResolverDiagCode::Collision,
-                            ResolverDiagSeverity::Error,
-                            current.display().to_string(),
-                            name.to_string_lossy().into_owned(),
-                        );
+                ParsedComponent::Normal(name) => {
+                    let is_last = idx + 1 == components.len();
+                    if is_last {
+                        let leaf_name = resolve_final(
+                            resolver,
+                            &current,
+                            name,
+                            intent,
+                            diag.as_deref_mut(),
+                            plan_trace.as_deref_mut(),
+                        )?;
+                        return Ok(win32::join_path(&current, &leaf_name));
                     }
-                    return Err(ResolverStatus::Collision);
+                    if let Some(plan_trace) = plan_trace.as_deref_mut() {
+                        resolver.record_dir_generation_for_path(&current, plan_trace);
+                    }
+                    let match_result = match win32::find_match(&current, name) {
+                        Ok(value) => value,
+                        Err(status) => {
+                            if status == ResolverStatus::PermissionDenied {
+                                if let Some(diag) = diag.as_deref_mut() {
+                                    diag.push(
+                                        ResolverDiagCode::PermissionDenied,
+                                        ResolverDiagSeverity::Error,
+                                        current.display().to_string(),
+                                        "permission denied listing directory".to_string(),
+                                    );
+                                }
+                            }
+                            return Err(status);
+                        }
+                    };
+                    if match_result.count == 0 {
+                        return Err(ResolverStatus::NotFound);
+                    }
+                    if match_result.count > 1 {
+                        resolver.metrics.collisions.fetch_add(1, Ordering::SeqCst);
+                        if let Some(diag) = diag.as_deref_mut() {
+                            diag.push(
+                                ResolverDiagCode::Collision,
+                                ResolverDiagSeverity::Error,
+                                current.display().to_string(),
+                                name.to_string_lossy().into_owned(),
+                            );
+                        }
+                        return Err(ResolverStatus::Collision);
+                    }
+                    let actual = match_result.unique_name.unwrap_or_else(|| name.clone());
+                    if (match_result.unique_attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+                        return Err(ResolverStatus::NotADirectory);
+                    }
+                    let next_path = win32::join_path(&current, &actual);
+                    stack.push((next_path.clone(), is_symlink_attr(match_result.unique_attrs)));
+                    current = next_path;
                 }
-                let actual = match_result.unique_name.unwrap_or_else(|| name.clone());
-                if (match_result.unique_attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
-                    return Err(ResolverStatus::NotADirectory);
-                }
-                let next_path = win32::join_path(&current, &actual);
-                stack.push((next_path.clone(), is_symlink_attr(match_result.unique_attrs)));
-                current = next_path;
             }
+        }
+
+        Ok(current)
+    })();
+
+    if matches!(result, Err(ResolverStatus::NotFound))
+        && absolute_input
+        && !is_create_intent(intent)
+        && intent != ResolverIntent::Mkdirs
+    {
+        if win32::get_file_attributes(Path::new(&normalized_input)).is_ok() {
+            return Ok(PathBuf::from(normalized_input));
         }
     }
 
-    Ok(current)
+    result
 }
 
 fn resolve_parent_and_leaf(

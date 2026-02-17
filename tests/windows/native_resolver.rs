@@ -378,18 +378,55 @@ fn ffi_resolved_path_lifetime_after_plan() {
 
     let (_base_buf, base_view) = make_view(&base);
     let (_input_buf, input_view) = make_view("plan.txt");
+    let mut plan = ResolverPlan {
+        size: std::mem::size_of::<ResolverPlan>() as u32,
+        status: ResolverStatus::Ok,
+        would_error: ResolverStatus::Ok,
+        flags: 0,
+        intent: ResolverIntent::StatExists,
+        resolved_parent: ResolverStringView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        resolved_leaf: ResolverStringView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        plan_token: ResolverPlanToken {
+            size: std::mem::size_of::<ResolverPlanToken>() as u32,
+            op_generation: 0,
+            unicode_version_generation: 0,
+            root_mapping_generation: 0,
+            absolute_path_support_generation: 0,
+            encoding_policy_generation: 0,
+            symlink_policy_generation: 0,
+            dir_generations: ResolverBufferView {
+                ptr: std::ptr::null(),
+                len: 0,
+            },
+            touched_dir_stamps: ResolverBufferView {
+                ptr: std::ptr::null(),
+                len: 0,
+            },
+            reserved: [0; 4],
+        },
+        reserved: [0; 6],
+    };
     let status = resolver_plan(
         resolver.handle,
         &base_view,
         &input_view,
         ResolverIntent::StatExists,
-        std::ptr::null_mut(),
+        &mut plan,
         std::ptr::null_mut(),
     );
     assert_eq!(status, ResolverStatus::Ok);
 
     let view_value_after = read_view(view).unwrap();
     assert_eq!(view_value, view_value_after);
+    resolver_free_buffer(plan.plan_token.dir_generations);
+    resolver_free_string(plan.resolved_parent);
+    resolver_free_string(plan.resolved_leaf);
     free_view(view);
 }
 
