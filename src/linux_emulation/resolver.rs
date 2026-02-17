@@ -35,12 +35,53 @@ struct ComponentSelection {
 #[derive(Debug, Default)]
 struct PlanTrace {
     dir_generations: HashMap<(u64, u64), u64>,
+    dir_stamps: HashMap<(u64, u64), DirStamp>,
 }
 
 impl PlanTrace {
     fn record(&mut self, dir_id: (u64, u64), generation: u64) {
         self.dir_generations.entry(dir_id).or_insert(generation);
     }
+
+    fn record_stamp(&mut self, dir_id: (u64, u64), stamp: DirStamp) {
+        self.dir_stamps.entry(dir_id).or_insert(stamp);
+    }
+}
+
+#[derive(Debug, Default)]
+struct DiagCollector {
+    entries: Vec<DiagEntryOwned>,
+}
+
+#[derive(Debug)]
+struct DiagEntryOwned {
+    code: ResolverDiagCode,
+    severity: ResolverDiagSeverity,
+    context: String,
+    detail: String,
+}
+
+impl DiagCollector {
+    fn push(&mut self, code: ResolverDiagCode, severity: ResolverDiagSeverity, context: String, detail: String) {
+        self.entries.push(DiagEntryOwned {
+            code,
+            severity,
+            context,
+            detail,
+        });
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetricsCounters {
+    dirindex_cache_hits: AtomicU64,
+    dirindex_cache_misses: AtomicU64,
+    dirindex_rebuilds: AtomicU64,
+    stamp_validations: AtomicU64,
+    collisions: AtomicU64,
+    invalid_utf8_entries: AtomicU64,
+    encoding_errors: AtomicU64,
+    plans_rejected_stale: AtomicU64,
 }
 
 fn map_io_error(err: &io::Error) -> ResolverStatus {
@@ -79,6 +120,8 @@ fn build_dir_index(
     strict_utf8: bool,
     dir_index_generation: u64,
     dir_generation: u64,
+    mut diag: Option<&mut DiagCollector>,
+    metrics: &MetricsCounters,
 ) -> Result<DirIndex, ResolverStatus> {
     trace(&format!("DirIndex build start: {}", dir.display()));
     let mut map: HashMap<String, EntrySet> = HashMap::new();
@@ -115,12 +158,30 @@ fn build_dir_index(
             }
             Err(_) => {
                 invalid_utf8_count += 1;
+                metrics.invalid_utf8_entries.fetch_add(1, Ordering::SeqCst);
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::InvalidUtf8EntrySkipped,
+                        ResolverDiagSeverity::Warning,
+                        dir.display().to_string(),
+                        format!("{:?}", name),
+                    );
+                }
                 trace(&format!(
                     "DirIndex skip invalid UTF-8 entry: {:?} (dir {})",
                     name,
                     dir.display()
                 ));
                 if strict_utf8 {
+                    metrics.encoding_errors.fetch_add(1, Ordering::SeqCst);
+                    if let Some(diag) = diag.as_deref_mut() {
+                        diag.push(
+                            ResolverDiagCode::EncodingError,
+                            ResolverDiagSeverity::Error,
+                            dir.display().to_string(),
+                            "invalid UTF-8 entry encountered".to_string(),
+                        );
+                    }
                     return Err(ResolverStatus::EncodingError);
                 }
             }
@@ -160,6 +221,7 @@ fn init_plan(plan: &mut ResolverPlan) {
     plan.status = ResolverStatus::Ok;
     plan.would_error = ResolverStatus::Ok;
     plan.flags = 0;
+    plan.intent = ResolverIntent::StatExists;
     plan.resolved_parent = ResolverStringView {
         ptr: std::ptr::null(),
         len: 0,
@@ -171,11 +233,20 @@ fn init_plan(plan: &mut ResolverPlan) {
     plan.plan_token = ResolverPlanToken {
         size: std::mem::size_of::<ResolverPlanToken>() as u32,
         op_generation: 0,
+        unicode_version_generation: 0,
+        root_mapping_generation: 0,
+        absolute_path_support_generation: 0,
+        encoding_policy_generation: 0,
+        symlink_policy_generation: 0,
         dir_generations: ResolverBufferView {
             ptr: std::ptr::null(),
             len: 0,
         },
-        reserved: [0; 6],
+        touched_dir_stamps: ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        reserved: [0; 4],
     };
     plan.reserved = [0; 6];
 }
@@ -217,6 +288,41 @@ fn write_plan_dir_generations(
     Ok(())
 }
 
+fn write_plan_dir_stamps(plan: &mut ResolverPlan, trace: &PlanTrace) -> Result<(), ResolverStatus> {
+    if trace.dir_stamps.is_empty() {
+        plan.plan_token.touched_dir_stamps = ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        return Ok(());
+    }
+    let count = trace.dir_stamps.len();
+    let bytes = count * std::mem::size_of::<ResolverDirStamp>();
+    let ptr = unsafe { libc::malloc(bytes) } as *mut ResolverDirStamp;
+    if ptr.is_null() {
+        return Err(ResolverStatus::IoError);
+    }
+    let mut entries: Vec<ResolverDirStamp> = Vec::with_capacity(count);
+    for (dir_id, stamp) in trace.dir_stamps.iter() {
+        entries.push(ResolverDirStamp {
+            dev: dir_id.0,
+            ino: dir_id.1,
+            mtime_sec: stamp.mtime_sec,
+            mtime_nsec: stamp.mtime_nsec,
+            ctime_sec: stamp.ctime_sec,
+            ctime_nsec: stamp.ctime_nsec,
+        });
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(entries.as_ptr(), ptr, count);
+    }
+    plan.plan_token.touched_dir_stamps = ResolverBufferView {
+        ptr: ptr as *const core::ffi::c_void,
+        len: count,
+    };
+    Ok(())
+}
+
 fn write_string_view(value: &str, out: &mut ResolverStringView) -> Result<(), ResolverStatus> {
     if value.is_empty() {
         out.ptr = std::ptr::null();
@@ -246,6 +352,68 @@ fn set_plan_paths(plan: &mut ResolverPlan, resolved: &Path) -> Result<(), Resolv
     write_string_view(&parent_str, &mut plan.resolved_parent)?;
     write_string_view(&leaf_str, &mut plan.resolved_leaf)?;
     Ok(())
+}
+
+fn write_diag_entries(out_diag: *mut ResolverDiag, collector: &DiagCollector) {
+    let out_diag = unsafe { out_diag.as_mut() };
+    let out_diag = match out_diag {
+        Some(out) => out,
+        None => return,
+    };
+    out_diag.size = std::mem::size_of::<ResolverDiag>() as u32;
+    out_diag.entries = ResolverBufferView {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    if collector.entries.is_empty() {
+        return;
+    }
+
+    let count = collector.entries.len();
+    let bytes = count * std::mem::size_of::<ResolverDiagEntry>();
+    let ptr = unsafe { libc::malloc(bytes) } as *mut ResolverDiagEntry;
+    if ptr.is_null() {
+        return;
+    }
+
+    let mut entries: Vec<ResolverDiagEntry> = Vec::with_capacity(count);
+    for entry in &collector.entries {
+        let mut context = ResolverStringView {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        let mut detail = ResolverStringView {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        if write_string_view(&entry.context, &mut context).is_err()
+            || write_string_view(&entry.detail, &mut detail).is_err()
+        {
+            // Best-effort: leave empty if allocation fails.
+            context = ResolverStringView {
+                ptr: std::ptr::null(),
+                len: 0,
+            };
+            detail = ResolverStringView {
+                ptr: std::ptr::null(),
+                len: 0,
+            };
+        }
+        entries.push(ResolverDiagEntry {
+            code: entry.code as u32,
+            severity: entry.severity as u32,
+            context,
+            detail,
+        });
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(entries.as_ptr(), ptr, count);
+    }
+    out_diag.entries = ResolverBufferView {
+        ptr: ptr as *const core::ffi::c_void,
+        len: count,
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -329,7 +497,12 @@ struct MkdirPlan {
     create_paths: Vec<PathBuf>,
 }
 
-fn parse_ttl_fast() -> Duration {
+fn parse_ttl_fast(config_ttl_ms: Option<u64>) -> Duration {
+    if let Some(value) = config_ttl_ms {
+        if value > 0 {
+            return Duration::from_millis(value);
+        }
+    }
     match std::env::var("WCFSS_TTL_FAST_MS") {
         Ok(value) => value
             .parse::<u64>()
@@ -344,26 +517,49 @@ fn select_component(
     resolver: &LinuxResolver,
     current: &Path,
     component: &str,
-    plan_trace: Option<&mut PlanTrace>,
+    mut plan_trace: Option<&mut PlanTrace>,
+    mut diag: Option<&mut DiagCollector>,
 ) -> Result<Option<ComponentSelection>, ResolverStatus> {
     let exact_path = current.join(component);
     match fs::symlink_metadata(&exact_path) {
         Ok(meta) => {
-            if let Some(plan_trace) = plan_trace {
+            if let Some(plan_trace) = plan_trace.as_deref_mut() {
                 resolver.record_dir_generation_for_path(current, plan_trace);
+                resolver.record_dir_stamp_for_path(current, plan_trace);
             }
+            let _ = resolver.get_dir_index(
+                current,
+                plan_trace.as_deref_mut(),
+                diag.as_deref_mut(),
+            );
             Ok(Some(ComponentSelection {
                 name: component.to_string(),
                 meta,
             }))
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let index = resolver.get_dir_index(current, plan_trace)?;
+            let index = resolver.get_dir_index(
+                current,
+                plan_trace.as_deref_mut(),
+                diag.as_deref_mut(),
+            )?;
             let key = parser::key_simple_uppercase(component);
             match index.fold_map.get(&key) {
                 None => Ok(None),
                 Some(EntrySet::Ambiguous(list)) => {
                     trace(&format!("DirIndex collision for key '{}': {:?}", key, list));
+                    resolver
+                        .metrics
+                        .collisions
+                        .fetch_add(1, Ordering::SeqCst);
+                    if let Some(diag) = diag.as_deref_mut() {
+                        diag.push(
+                            ResolverDiagCode::Collision,
+                            ResolverDiagSeverity::Error,
+                            current.display().to_string(),
+                            list.join(", "),
+                        );
+                    }
                     Err(ResolverStatus::Collision)
                 }
                 Some(EntrySet::Unique(actual)) => {
@@ -386,6 +582,7 @@ fn resolve_path(
     input_path: &str,
     intent: ResolverIntent,
     mut plan_trace: Option<&mut PlanTrace>,
+    mut diag: Option<&mut DiagCollector>,
 ) -> Result<ResolvedInfo, ResolverStatus> {
     if input_path.as_bytes().len() > MAX_INPUT_PATH_BYTES {
         return Err(ResolverStatus::PathTooLong);
@@ -394,9 +591,39 @@ fn resolve_path(
     let (normalized, had_backslash) = normalize_input(input_path);
     if had_backslash {
         trace("Input contained backslashes; normalized to forward slashes.");
+        if let Some(diag) = diag.as_deref_mut() {
+            diag.push(
+                ResolverDiagCode::BackslashNormalized,
+                ResolverDiagSeverity::Warning,
+                input_path.to_string(),
+                "input contained backslashes".to_string(),
+            );
+        }
     }
 
-    let root = classify_root(&normalized)?;
+    let root = match classify_root(&normalized) {
+        Ok(value) => value,
+        Err(status) => {
+            if let Some(diag) = diag.as_deref_mut() {
+                match status {
+                    ResolverStatus::UnsupportedAbsolutePath => diag.push(
+                        ResolverDiagCode::UnsupportedAbsolutePath,
+                        ResolverDiagSeverity::Error,
+                        input_path.to_string(),
+                        "unsupported absolute path".to_string(),
+                    ),
+                    ResolverStatus::UnmappedRoot => diag.push(
+                        ResolverDiagCode::UnmappedRoot,
+                        ResolverDiagSeverity::Error,
+                        input_path.to_string(),
+                        "unmapped root".to_string(),
+                    ),
+                    _ => {}
+                }
+            }
+            return Err(status);
+        }
+    };
     let mut current = root.unwrap_or_else(|| base_dir.to_path_buf());
     let mut stack: Vec<(PathBuf, bool)> = vec![(current.clone(), false)];
 
@@ -435,11 +662,27 @@ fn resolve_path(
         if *component == ".." {
             if stack.len() <= 1 {
                 trace("Encountered .. at root boundary.");
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::EscapesRoot,
+                        ResolverDiagSeverity::Error,
+                        current.display().to_string(),
+                        "path escapes root".to_string(),
+                    );
+                }
                 return Err(ResolverStatus::EscapesRoot);
             }
             let (_, was_symlink) = stack.pop().unwrap();
             if was_symlink {
                 trace("Encountered .. across symlink boundary.");
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::SymlinkLoop,
+                        ResolverDiagSeverity::Error,
+                        current.display().to_string(),
+                        "path traversed across symlink boundary".to_string(),
+                    );
+                }
                 return Err(ResolverStatus::InvalidPath);
             }
             current = stack.last().unwrap().0.clone();
@@ -454,7 +697,13 @@ fn resolve_path(
         let selection = if intent == ResolverIntent::Mkdirs && creating {
             None
         } else {
-            match select_component(resolver, &current, component, plan_trace.as_deref_mut()) {
+            match select_component(
+                resolver,
+                &current,
+                component,
+                plan_trace.as_deref_mut(),
+                diag.as_deref_mut(),
+            ) {
                 Ok(value) => value,
                 Err(status) => return Err(status),
             }
@@ -477,12 +726,28 @@ fn resolve_path(
                     "Symlink cycle detected at dev={}, ino={}.",
                     dev, ino
                 ));
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::SymlinkLoop,
+                        ResolverDiagSeverity::Error,
+                        next_path.display().to_string(),
+                        "symlink cycle detected".to_string(),
+                    );
+                }
                 return Err(ResolverStatus::TooManySymlinks);
             }
             if symlink_depth >= SYMLINK_DEPTH_LIMIT {
                 trace(&format!(
                     "Symlink depth limit exceeded (limit={SYMLINK_DEPTH_LIMIT})."
                 ));
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::SymlinkLoop,
+                        ResolverDiagSeverity::Error,
+                        next_path.display().to_string(),
+                        "symlink depth limit exceeded".to_string(),
+                    );
+                }
                 return Err(ResolverStatus::TooManySymlinks);
             }
             visited_symlinks.insert((dev, ino));
@@ -590,6 +855,7 @@ fn plan_mkdirs(
     base_dir: &Path,
     input_path: &str,
     mut plan_trace: Option<&mut PlanTrace>,
+    mut diag: Option<&mut DiagCollector>,
 ) -> Result<MkdirPlan, ResolverStatus> {
     if input_path.as_bytes().len() > MAX_INPUT_PATH_BYTES {
         return Err(ResolverStatus::PathTooLong);
@@ -598,9 +864,39 @@ fn plan_mkdirs(
     let (normalized, had_backslash) = normalize_input(input_path);
     if had_backslash {
         trace("Input contained backslashes; normalized to forward slashes.");
+        if let Some(diag) = diag.as_deref_mut() {
+            diag.push(
+                ResolverDiagCode::BackslashNormalized,
+                ResolverDiagSeverity::Warning,
+                input_path.to_string(),
+                "input contained backslashes".to_string(),
+            );
+        }
     }
 
-    let root = classify_root(&normalized)?;
+    let root = match classify_root(&normalized) {
+        Ok(value) => value,
+        Err(status) => {
+            if let Some(diag) = diag.as_deref_mut() {
+                match status {
+                    ResolverStatus::UnsupportedAbsolutePath => diag.push(
+                        ResolverDiagCode::UnsupportedAbsolutePath,
+                        ResolverDiagSeverity::Error,
+                        input_path.to_string(),
+                        "unsupported absolute path".to_string(),
+                    ),
+                    ResolverStatus::UnmappedRoot => diag.push(
+                        ResolverDiagCode::UnmappedRoot,
+                        ResolverDiagSeverity::Error,
+                        input_path.to_string(),
+                        "unmapped root".to_string(),
+                    ),
+                    _ => {}
+                }
+            }
+            return Err(status);
+        }
+    };
     let mut current = root.unwrap_or_else(|| base_dir.to_path_buf());
     let mut stack: Vec<(PathBuf, bool)> = vec![(current.clone(), false)];
 
@@ -634,11 +930,27 @@ fn plan_mkdirs(
         if *component == ".." {
             if stack.len() <= 1 {
                 trace("Encountered .. at root boundary.");
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::EscapesRoot,
+                        ResolverDiagSeverity::Error,
+                        current.display().to_string(),
+                        "path escapes root".to_string(),
+                    );
+                }
                 return Err(ResolverStatus::EscapesRoot);
             }
             let (_, was_symlink) = stack.pop().unwrap();
             if was_symlink {
                 trace("Encountered .. across symlink boundary.");
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::SymlinkLoop,
+                        ResolverDiagSeverity::Error,
+                        current.display().to_string(),
+                        "path traversed across symlink boundary".to_string(),
+                    );
+                }
                 return Err(ResolverStatus::InvalidPath);
             }
             current = stack.last().unwrap().0.clone();
@@ -665,9 +977,13 @@ fn plan_mkdirs(
             current.display()
         ));
 
-        let selection =
-            match select_component(resolver, &current, component, plan_trace.as_deref_mut())
-        {
+        let selection = match select_component(
+            resolver,
+            &current,
+            component,
+            plan_trace.as_deref_mut(),
+            diag.as_deref_mut(),
+        ) {
             Ok(value) => value,
             Err(status) => return Err(status),
         };
@@ -684,19 +1000,35 @@ fn plan_mkdirs(
                 trace(&format!("Encountered symlink: {}", next_path.display()));
                 let dev = selected_meta.dev();
                 let ino = selected_meta.ino();
-                if visited_symlinks.contains(&(dev, ino)) {
-                    trace(&format!(
-                        "Symlink cycle detected at dev={}, ino={}.",
-                        dev, ino
-                    ));
-                    return Err(ResolverStatus::TooManySymlinks);
+            if visited_symlinks.contains(&(dev, ino)) {
+                trace(&format!(
+                    "Symlink cycle detected at dev={}, ino={}.",
+                    dev, ino
+                ));
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::SymlinkLoop,
+                        ResolverDiagSeverity::Error,
+                        next_path.display().to_string(),
+                        "symlink cycle detected".to_string(),
+                    );
                 }
-                if symlink_depth >= SYMLINK_DEPTH_LIMIT {
-                    trace(&format!(
-                        "Symlink depth limit exceeded (limit={SYMLINK_DEPTH_LIMIT})."
-                    ));
-                    return Err(ResolverStatus::TooManySymlinks);
+                return Err(ResolverStatus::TooManySymlinks);
+            }
+            if symlink_depth >= SYMLINK_DEPTH_LIMIT {
+                trace(&format!(
+                    "Symlink depth limit exceeded (limit={SYMLINK_DEPTH_LIMIT})."
+                ));
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::SymlinkLoop,
+                        ResolverDiagSeverity::Error,
+                        next_path.display().to_string(),
+                        "symlink depth limit exceeded".to_string(),
+                    );
                 }
+                return Err(ResolverStatus::TooManySymlinks);
+            }
                 visited_symlinks.insert((dev, ino));
                 symlink_depth += 1;
                 trace(&format!(
@@ -762,14 +1094,19 @@ pub struct LinuxResolver {
     op_generation: AtomicU64,
     mutation_lock: Mutex<()>,
     dir_generations: RwLock<HashMap<(u64, u64), u64>>,
+    metrics: MetricsCounters,
 }
 
 impl LinuxResolver {
     pub fn new(config: *const ResolverConfig) -> Self {
-        // TODO(linux): initialize caches and Unicode tables.
-        let strict_utf8 = unsafe { config.as_ref() }
-            .map(|cfg| cfg.flags & RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY != 0)
-            .unwrap_or(false);
+        let mut strict_utf8 = false;
+        let mut config_ttl_ms = None;
+        if let Some(cfg) = unsafe { config.as_ref() } {
+            strict_utf8 = cfg.flags & RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY != 0;
+            if cfg.size as usize >= std::mem::size_of::<ResolverConfig>() {
+                config_ttl_ms = Some(cfg.ttl_fast_ms);
+            }
+        }
         let encoding_policy_generation = if strict_utf8 { 1 } else { 0 };
         let generations = ResolverGenerations {
             unicode_version_generation: 1,
@@ -779,8 +1116,7 @@ impl LinuxResolver {
             symlink_policy_generation: 0,
         };
         let cache_generation = combine_generations(generations);
-        let ttl_fast = parse_ttl_fast();
-        // TODO(spec): ttl_fast should be configurable per resolver instance.
+        let ttl_fast = parse_ttl_fast(config_ttl_ms);
         Self {
             strict_utf8,
             ttl_fast,
@@ -791,6 +1127,7 @@ impl LinuxResolver {
             op_generation: AtomicU64::new(0),
             mutation_lock: Mutex::new(()),
             dir_generations: RwLock::new(HashMap::new()),
+            metrics: MetricsCounters::default(),
         }
     }
 
@@ -813,6 +1150,7 @@ impl LinuxResolver {
         &self,
         dir: &Path,
         plan_trace: Option<&mut PlanTrace>,
+        diag: Option<&mut DiagCollector>,
     ) -> Result<DirIndex, ResolverStatus> {
         // Locking strategy:
         // - Never hold dir_cache locks during OS calls (metadata/read_dir).
@@ -826,6 +1164,7 @@ impl LinuxResolver {
         let dir_generation = self.current_dir_generation(dir_id);
         if let Some(plan_trace) = plan_trace {
             plan_trace.record(dir_id, dir_generation);
+            plan_trace.record_stamp(dir_id, stamp.clone());
         }
 
         let cached = {
@@ -836,6 +1175,9 @@ impl LinuxResolver {
         if let Some(entry) = cached {
             let age = now.duration_since(entry.built_at);
             if age < self.ttl_fast {
+                self.metrics
+                    .dirindex_cache_hits
+                    .fetch_add(1, Ordering::SeqCst);
                 trace(&format!(
                     "DirIndex cache hit (ttl_fast, age {:?}).",
                     age
@@ -843,6 +1185,12 @@ impl LinuxResolver {
                 return Ok(entry);
             }
             if entry.stamp.matches(&stamp) {
+                self.metrics
+                    .stamp_validations
+                    .fetch_add(1, Ordering::SeqCst);
+                self.metrics
+                    .dirindex_cache_hits
+                    .fetch_add(1, Ordering::SeqCst);
                 trace("DirIndex cache hit (stamp match); refreshing built_at.");
                 let mut cache = self.dir_cache.write().expect("dir_cache lock poisoned");
                 if let Some(existing) = cache.get_mut(&dir_id) {
@@ -854,6 +1202,9 @@ impl LinuxResolver {
             }
             trace("DirIndex cache stale; rebuilding.");
         } else {
+            self.metrics
+                .dirindex_cache_misses
+                .fetch_add(1, Ordering::SeqCst);
             trace("DirIndex cache miss; building.");
         }
 
@@ -862,7 +1213,12 @@ impl LinuxResolver {
             self.strict_utf8,
             self.current_dir_index_generation(),
             dir_generation,
+            diag,
+            &self.metrics,
         )?;
+        self.metrics
+            .dirindex_rebuilds
+            .fetch_add(1, Ordering::SeqCst);
         let mut cache = self.dir_cache.write().expect("dir_cache lock poisoned");
         cache.insert(index.dir_id, index.clone());
         evict_if_needed(&mut cache, self.cache_max_entries);
@@ -907,6 +1263,14 @@ impl LinuxResolver {
             let dir_id = (meta.dev(), meta.ino());
             let generation = self.current_dir_generation(dir_id);
             plan_trace.record(dir_id, generation);
+        }
+    }
+
+    fn record_dir_stamp_for_path(&self, path: &Path, plan_trace: &mut PlanTrace) {
+        if let Ok(meta) = fs::metadata(path) {
+            let dir_id = (meta.dev(), meta.ino());
+            let stamp = DirStamp::from_meta(&meta);
+            plan_trace.record_stamp(dir_id, stamp);
         }
     }
 
@@ -957,7 +1321,7 @@ impl Resolver for LinuxResolver {
         input_path: *const ResolverStringView,
         intent: ResolverIntent,
         out_plan: *mut ResolverPlan,
-        _out_diag: *mut ResolverDiag,
+        out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         let base_dir = match string_view_to_string(base_dir) {
             Ok(value) => value,
@@ -979,6 +1343,7 @@ impl Resolver for LinuxResolver {
         };
 
         let plan_out = unsafe { out_plan.as_mut() };
+        let mut diag = DiagCollector::default();
 
         let mut plan_trace = PlanTrace::default();
         match resolve_path(
@@ -987,6 +1352,7 @@ impl Resolver for LinuxResolver {
             &input_path,
             intent,
             Some(&mut plan_trace),
+            Some(&mut diag),
         ) {
             Ok(info) => {
                 trace(&format!(
@@ -1013,21 +1379,41 @@ impl Resolver for LinuxResolver {
                 if let Some(plan_out) = plan_out {
                     init_plan(plan_out);
                     plan_out.flags = flags;
+                    plan_out.intent = intent;
                     plan_out.status = ResolverStatus::Ok;
                     plan_out.would_error = ResolverStatus::Ok;
+                    let generations = self.generations.read().expect("generations lock poisoned");
                     plan_out.plan_token.op_generation =
                         self.op_generation.load(Ordering::SeqCst);
+                    plan_out.plan_token.unicode_version_generation =
+                        generations.unicode_version_generation;
+                    plan_out.plan_token.root_mapping_generation = generations.root_mapping_generation;
+                    plan_out.plan_token.absolute_path_support_generation =
+                        generations.absolute_path_support_generation;
+                    plan_out.plan_token.encoding_policy_generation =
+                        generations.encoding_policy_generation;
+                    plan_out.plan_token.symlink_policy_generation =
+                        generations.symlink_policy_generation;
                     if let Err(status) = write_plan_dir_generations(plan_out, &plan_trace) {
                         plan_out.status = status;
                         plan_out.would_error = status;
+                        write_diag_entries(out_diag, &diag);
+                        return status;
+                    }
+                    if let Err(status) = write_plan_dir_stamps(plan_out, &plan_trace) {
+                        plan_out.status = status;
+                        plan_out.would_error = status;
+                        write_diag_entries(out_diag, &diag);
                         return status;
                     }
                     if let Err(status) = set_plan_paths(plan_out, &info.path) {
                         plan_out.status = status;
                         plan_out.would_error = status;
+                        write_diag_entries(out_diag, &diag);
                         return status;
                     }
                 }
+                write_diag_entries(out_diag, &diag);
                 ResolverStatus::Ok
             }
             Err(status) => {
@@ -1036,10 +1422,23 @@ impl Resolver for LinuxResolver {
                     init_plan(plan_out);
                     plan_out.status = status;
                     plan_out.would_error = status;
+                    plan_out.intent = intent;
                     plan_out.plan_token.op_generation =
                         self.op_generation.load(Ordering::SeqCst);
+                    let generations = self.generations.read().expect("generations lock poisoned");
+                    plan_out.plan_token.unicode_version_generation =
+                        generations.unicode_version_generation;
+                    plan_out.plan_token.root_mapping_generation = generations.root_mapping_generation;
+                    plan_out.plan_token.absolute_path_support_generation =
+                        generations.absolute_path_support_generation;
+                    plan_out.plan_token.encoding_policy_generation =
+                        generations.encoding_policy_generation;
+                    plan_out.plan_token.symlink_policy_generation =
+                        generations.symlink_policy_generation;
                     let _ = write_plan_dir_generations(plan_out, &plan_trace);
+                    let _ = write_plan_dir_stamps(plan_out, &plan_trace);
                 }
+                write_diag_entries(out_diag, &diag);
                 status
             }
         }
@@ -1050,7 +1449,7 @@ impl Resolver for LinuxResolver {
         base_dir: *const ResolverStringView,
         input_path: *const ResolverStringView,
         out_result: *mut ResolverResult,
-        _out_diag: *mut ResolverDiag,
+        out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         self.begin_execute();
         let base_dir = match string_view_to_string(base_dir) {
@@ -1071,12 +1470,17 @@ impl Resolver for LinuxResolver {
             out.reserved = [0; 6];
         }
 
-        let plan = match plan_mkdirs(self, &base_dir_path, &input_path, None) {
+        let mut diag = DiagCollector::default();
+        let plan = match plan_mkdirs(self, &base_dir_path, &input_path, None, Some(&mut diag)) {
             Ok(value) => value,
-            Err(status) => return status,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
         };
 
         if plan.create_paths.is_empty() {
+            write_diag_entries(out_diag, &diag);
             return ResolverStatus::Ok;
         }
 
@@ -1113,6 +1517,7 @@ impl Resolver for LinuxResolver {
                         for parent in &parents_to_invalidate {
                             self.invalidate_dir_index(parent);
                         }
+                        write_diag_entries(out_diag, &diag);
                         return ResolverStatus::NotADirectory;
                     }
                 }
@@ -1120,6 +1525,15 @@ impl Resolver for LinuxResolver {
                     for parent in &parents_to_invalidate {
                         self.invalidate_dir_index(parent);
                     }
+                    if err.kind() == io::ErrorKind::PermissionDenied {
+                        diag.push(
+                            ResolverDiagCode::PermissionDenied,
+                            ResolverDiagSeverity::Error,
+                            create_path.display().to_string(),
+                            "permission denied creating directory".to_string(),
+                        );
+                    }
+                    write_diag_entries(out_diag, &diag);
                     return map_io_error(&err);
                 }
             }
@@ -1129,6 +1543,7 @@ impl Resolver for LinuxResolver {
             self.invalidate_dir_index(parent);
         }
 
+        write_diag_entries(out_diag, &diag);
         ResolverStatus::Ok
     }
 
@@ -1138,7 +1553,7 @@ impl Resolver for LinuxResolver {
         from_path: *const ResolverStringView,
         to_path: *const ResolverStringView,
         out_result: *mut ResolverResult,
-        _out_diag: *mut ResolverDiag,
+        out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         self.begin_execute();
         let base_dir = match string_view_to_string(base_dir) {
@@ -1163,15 +1578,36 @@ impl Resolver for LinuxResolver {
             out.reserved = [0; 6];
         }
 
-        let source = match resolve_path(self, &base_dir_path, &from_path, ResolverIntent::Read, None) {
+        let mut diag = DiagCollector::default();
+        let source = match resolve_path(
+            self,
+            &base_dir_path,
+            &from_path,
+            ResolverIntent::Read,
+            None,
+            Some(&mut diag),
+        ) {
             Ok(value) => value,
-            Err(status) => return status,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
         };
 
         let destination =
-            match resolve_path(self, &base_dir_path, &to_path, ResolverIntent::WriteTruncate, None) {
+            match resolve_path(
+                self,
+                &base_dir_path,
+                &to_path,
+                ResolverIntent::WriteTruncate,
+                None,
+                Some(&mut diag),
+            ) {
                 Ok(value) => value,
-                Err(status) => return status,
+                Err(status) => {
+                    write_diag_entries(out_diag, &diag);
+                    return status;
+                }
             };
 
         trace(&format!(
@@ -1190,6 +1626,15 @@ impl Resolver for LinuxResolver {
         self.bump_dir_generations_for_paths(&parents);
 
         if let Err(err) = fs::rename(&source.path, &destination.path) {
+            if err.kind() == io::ErrorKind::PermissionDenied {
+                diag.push(
+                    ResolverDiagCode::PermissionDenied,
+                    ResolverDiagSeverity::Error,
+                    source.path.display().to_string(),
+                    "permission denied renaming".to_string(),
+                );
+            }
+            write_diag_entries(out_diag, &diag);
             return map_io_error(&err);
         }
 
@@ -1200,6 +1645,7 @@ impl Resolver for LinuxResolver {
             self.invalidate_dir_index(parent);
         }
 
+        write_diag_entries(out_diag, &diag);
         ResolverStatus::Ok
     }
 
@@ -1208,7 +1654,7 @@ impl Resolver for LinuxResolver {
         base_dir: *const ResolverStringView,
         input_path: *const ResolverStringView,
         out_result: *mut ResolverResult,
-        _out_diag: *mut ResolverDiag,
+        out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         self.begin_execute();
         let base_dir = match string_view_to_string(base_dir) {
@@ -1229,11 +1675,23 @@ impl Resolver for LinuxResolver {
             out.reserved = [0; 6];
         }
 
-        let info = match resolve_path(self, &base_dir_path, &input_path, ResolverIntent::Read, None) {
+        let mut diag = DiagCollector::default();
+        let info = match resolve_path(
+            self,
+            &base_dir_path,
+            &input_path,
+            ResolverIntent::Read,
+            None,
+            Some(&mut diag),
+        ) {
             Ok(value) => value,
-            Err(status) => return status,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
         };
         if info.target_is_dir {
+            write_diag_entries(out_diag, &diag);
             return ResolverStatus::NotADirectory;
         }
 
@@ -1245,11 +1703,21 @@ impl Resolver for LinuxResolver {
             self.bump_dir_generations_for_paths(&[parent.to_path_buf()]);
         }
         if let Err(err) = fs::remove_file(&info.path) {
+            if err.kind() == io::ErrorKind::PermissionDenied {
+                diag.push(
+                    ResolverDiagCode::PermissionDenied,
+                    ResolverDiagSeverity::Error,
+                    info.path.display().to_string(),
+                    "permission denied removing file".to_string(),
+                );
+            }
+            write_diag_entries(out_diag, &diag);
             return map_io_error(&err);
         }
         if let Some(parent) = info.path.parent() {
             self.invalidate_dir_index(parent);
         }
+        write_diag_entries(out_diag, &diag);
         ResolverStatus::Ok
     }
 
@@ -1259,7 +1727,7 @@ impl Resolver for LinuxResolver {
         input_path: *const ResolverStringView,
         intent: ResolverIntent,
         out_resolved_path: *mut ResolverResolvedPath,
-        _out_diag: *mut ResolverDiag,
+        out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         self.begin_execute();
         let base_dir = match string_view_to_string(base_dir) {
@@ -1275,9 +1743,20 @@ impl Resolver for LinuxResolver {
             Err(status) => return status,
         };
 
-        let info = match resolve_path(self, &base_dir_path, &input_path, intent, None) {
+        let mut diag = DiagCollector::default();
+        let info = match resolve_path(
+            self,
+            &base_dir_path,
+            &input_path,
+            intent,
+            None,
+            Some(&mut diag),
+        ) {
             Ok(value) => value,
-            Err(status) => return status,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
         };
 
         let out_resolved_path = unsafe { out_resolved_path.as_mut() };
@@ -1291,10 +1770,12 @@ impl Resolver for LinuxResolver {
         if bytes.is_empty() {
             out_resolved_path.value.ptr = std::ptr::null();
             out_resolved_path.value.len = 0;
+            write_diag_entries(out_diag, &diag);
             return ResolverStatus::Ok;
         }
         let ptr = unsafe { libc::malloc(bytes.len()) } as *mut u8;
         if ptr.is_null() {
+            write_diag_entries(out_diag, &diag);
             return ResolverStatus::IoError;
         }
         unsafe {
@@ -1302,6 +1783,7 @@ impl Resolver for LinuxResolver {
         }
         out_resolved_path.value.ptr = ptr as *const core::ffi::c_char;
         out_resolved_path.value.len = bytes.len();
+        write_diag_entries(out_diag, &diag);
         ResolverStatus::Ok
     }
 
@@ -1311,7 +1793,7 @@ impl Resolver for LinuxResolver {
         input_path: *const ResolverStringView,
         intent: ResolverIntent,
         out_fd: *mut i32,
-        _out_diag: *mut ResolverDiag,
+        out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         if out_fd.is_null() {
             return ResolverStatus::InvalidPath;
@@ -1330,9 +1812,20 @@ impl Resolver for LinuxResolver {
             Err(status) => return status,
         };
 
-        let info = match resolve_path(self, &base_dir_path, &input_path, intent, None) {
+        let mut diag = DiagCollector::default();
+        let info = match resolve_path(
+            self,
+            &base_dir_path,
+            &input_path,
+            intent,
+            None,
+            Some(&mut diag),
+        ) {
             Ok(value) => value,
-            Err(status) => return status,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
         };
 
         let flags = match intent {
@@ -1355,6 +1848,15 @@ impl Resolver for LinuxResolver {
         let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o666) };
         if fd < 0 {
             let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::PermissionDenied {
+                diag.push(
+                    ResolverDiagCode::PermissionDenied,
+                    ResolverDiagSeverity::Error,
+                    info.path.display().to_string(),
+                    "permission denied opening file".to_string(),
+                );
+            }
+            write_diag_entries(out_diag, &diag);
             return map_io_error(&err);
         }
         if info.would_create {
@@ -1365,6 +1867,7 @@ impl Resolver for LinuxResolver {
         unsafe {
             *out_fd = fd;
         }
+        write_diag_entries(out_diag, &diag);
         ResolverStatus::Ok
     }
 
@@ -1372,13 +1875,15 @@ impl Resolver for LinuxResolver {
         &self,
         plan: *const ResolverPlan,
         _out_result: *mut ResolverResult,
-        _out_diag: *mut ResolverDiag,
+        out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         let plan = unsafe { plan.as_ref() }.ok_or(ResolverStatus::InvalidPath);
         let plan = match plan {
             Ok(value) => value,
             Err(status) => return status,
         };
+
+        let diag = DiagCollector::default();
 
         // Lock ordering: mutation_lock -> (optional) dir_cache write.
         // Validation happens under mutation_lock to prevent concurrent execute
@@ -1390,16 +1895,45 @@ impl Resolver for LinuxResolver {
         let expected_token_size = std::mem::size_of::<ResolverPlanToken>() as u32;
         let expected_plan_size = std::mem::size_of::<ResolverPlan>() as u32;
         if plan.size < expected_plan_size || plan.plan_token.size < expected_token_size {
+            self.metrics
+                .plans_rejected_stale
+                .fetch_add(1, Ordering::SeqCst);
+            write_diag_entries(out_diag, &diag);
             return ResolverStatus::StalePlan;
         }
 
         let current = self.op_generation.load(Ordering::SeqCst);
         if plan.plan_token.op_generation != current {
+            self.metrics
+                .plans_rejected_stale
+                .fetch_add(1, Ordering::SeqCst);
+            write_diag_entries(out_diag, &diag);
             return ResolverStatus::StalePlan;
+        }
+
+        {
+            let generations = self.generations.read().expect("generations lock poisoned");
+            if plan.plan_token.unicode_version_generation != generations.unicode_version_generation
+                || plan.plan_token.root_mapping_generation != generations.root_mapping_generation
+                || plan.plan_token.absolute_path_support_generation
+                    != generations.absolute_path_support_generation
+                || plan.plan_token.encoding_policy_generation != generations.encoding_policy_generation
+                || plan.plan_token.symlink_policy_generation != generations.symlink_policy_generation
+            {
+                self.metrics
+                    .plans_rejected_stale
+                    .fetch_add(1, Ordering::SeqCst);
+                write_diag_entries(out_diag, &diag);
+                return ResolverStatus::StalePlan;
+            }
         }
 
         let dir_view = plan.plan_token.dir_generations;
         if dir_view.len > 0 && dir_view.ptr.is_null() {
+            self.metrics
+                .plans_rejected_stale
+                .fetch_add(1, Ordering::SeqCst);
+            write_diag_entries(out_diag, &diag);
             return ResolverStatus::StalePlan;
         }
         if dir_view.len > 0 {
@@ -1413,6 +1947,68 @@ impl Resolver for LinuxResolver {
                 let dir_id = (entry.dev, entry.ino);
                 let current = self.current_dir_generation(dir_id);
                 if current != entry.generation {
+                    self.metrics
+                        .plans_rejected_stale
+                        .fetch_add(1, Ordering::SeqCst);
+                    write_diag_entries(out_diag, &diag);
+                    return ResolverStatus::StalePlan;
+                }
+            }
+        }
+
+        let stamp_view = plan.plan_token.touched_dir_stamps;
+        if stamp_view.len > 0 && stamp_view.ptr.is_null() {
+            self.metrics
+                .plans_rejected_stale
+                .fetch_add(1, Ordering::SeqCst);
+            write_diag_entries(out_diag, &diag);
+            return ResolverStatus::StalePlan;
+        }
+        if stamp_view.len > 0 {
+            let entries = unsafe {
+                std::slice::from_raw_parts(
+                    stamp_view.ptr as *const ResolverDirStamp,
+                    stamp_view.len,
+                )
+            };
+            for entry in entries {
+                let dir_id = (entry.dev, entry.ino);
+                let diag_path = {
+                    let cache = self.dir_cache.read().expect("dir_cache lock poisoned");
+                    cache.get(&dir_id).map(|entry| entry.diag_path.clone())
+                };
+                let diag_path = match diag_path {
+                    Some(value) => value,
+                    None => {
+                        self.metrics
+                            .plans_rejected_stale
+                            .fetch_add(1, Ordering::SeqCst);
+                        write_diag_entries(out_diag, &diag);
+                        return ResolverStatus::StalePlan;
+                    }
+                };
+                let meta = match fs::metadata(&diag_path) {
+                    Ok(meta) => meta,
+                    Err(_) => {
+                        self.metrics
+                            .plans_rejected_stale
+                            .fetch_add(1, Ordering::SeqCst);
+                        write_diag_entries(out_diag, &diag);
+                        return ResolverStatus::StalePlan;
+                    }
+                };
+                let stamp = DirStamp::from_meta(&meta);
+                if stamp.dev != dir_id.0
+                    || stamp.ino != dir_id.1
+                    || stamp.mtime_sec != entry.mtime_sec
+                    || stamp.mtime_nsec != entry.mtime_nsec
+                    || stamp.ctime_sec != entry.ctime_sec
+                    || stamp.ctime_nsec != entry.ctime_nsec
+                {
+                    self.metrics
+                        .plans_rejected_stale
+                        .fetch_add(1, Ordering::SeqCst);
+                    write_diag_entries(out_diag, &diag);
                     return ResolverStatus::StalePlan;
                 }
             }
@@ -1421,8 +2017,99 @@ impl Resolver for LinuxResolver {
         // Increment at the start of the mutation phase (before any filesystem mutation).
         self.op_generation.fetch_add(1, Ordering::SeqCst);
 
-        // TODO(linux): execute mutation based on plan intent and resolved paths.
-        ResolverStatus::IoError
+        let parent = match string_view_to_string(&plan.resolved_parent as *const ResolverStringView)
+        {
+            Ok(value) => value,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
+        };
+        let leaf = match string_view_to_string(&plan.resolved_leaf as *const ResolverStringView) {
+            Ok(value) => value,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
+        };
+        let mut path = PathBuf::from(parent);
+        if !leaf.is_empty() {
+            path = path.join(leaf);
+        }
+
+        let intent = plan.intent;
+        match intent {
+            ResolverIntent::StatExists | ResolverIntent::Read => {
+                let meta = fs::metadata(&path);
+                if let Err(err) = meta {
+                    let status = map_io_error(&err);
+                    write_diag_entries(out_diag, &diag);
+                    return status;
+                }
+                write_diag_entries(out_diag, &diag);
+                ResolverStatus::Ok
+            }
+            ResolverIntent::Mkdirs => {
+                let mut parents = Vec::new();
+                for ancestor in path.ancestors().skip(1) {
+                    parents.push(ancestor.to_path_buf());
+                }
+                self.bump_dir_generations_for_paths(&parents);
+                let status = match fs::create_dir_all(&path) {
+                    Ok(_) => ResolverStatus::Ok,
+                    Err(err) => map_io_error(&err),
+                };
+                if status == ResolverStatus::Ok {
+                    if let Some(parent) = path.parent() {
+                        self.invalidate_dir_index(parent);
+                    }
+                }
+                write_diag_entries(out_diag, &diag);
+                status
+            }
+            ResolverIntent::WriteTruncate
+            | ResolverIntent::WriteAppend
+            | ResolverIntent::CreateNew => {
+                let flags = match intent {
+                    ResolverIntent::WriteAppend => libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT,
+                    ResolverIntent::WriteTruncate => libc::O_WRONLY | libc::O_TRUNC | libc::O_CREAT,
+                    ResolverIntent::CreateNew => libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    _ => libc::O_RDONLY,
+                };
+                if (plan.flags & RESOLVER_PLAN_WOULD_CREATE) != 0 {
+                    if let Some(parent) = path.parent() {
+                        self.bump_dir_generations_for_paths(&[parent.to_path_buf()]);
+                    }
+                }
+                let c_path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        write_diag_entries(out_diag, &diag);
+                        return ResolverStatus::InvalidPath;
+                    }
+                };
+                let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o666) };
+                if fd < 0 {
+                    let err = io::Error::last_os_error();
+                    write_diag_entries(out_diag, &diag);
+                    return map_io_error(&err);
+                }
+                unsafe {
+                    libc::close(fd);
+                }
+                if (plan.flags & RESOLVER_PLAN_WOULD_CREATE) != 0 {
+                    if let Some(parent) = path.parent() {
+                        self.invalidate_dir_index(parent);
+                    }
+                }
+                write_diag_entries(out_diag, &diag);
+                ResolverStatus::Ok
+            }
+            ResolverIntent::Rename => {
+                write_diag_entries(out_diag, &diag);
+                ResolverStatus::InvalidPath
+            }
+        }
     }
 
     fn get_metrics(&self, _out_metrics: *mut ResolverMetrics) -> ResolverStatus {

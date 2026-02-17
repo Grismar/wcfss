@@ -15,7 +15,8 @@ impl TestResolver {
         let config = ResolverConfig {
             size: std::mem::size_of::<ResolverConfig>() as u32,
             flags: 0,
-            reserved: [0; 6],
+            ttl_fast_ms: 0,
+            reserved: [0; 5],
         };
         let handle = resolver_create(&config);
         Self { handle }

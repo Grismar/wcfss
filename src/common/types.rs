@@ -39,7 +39,8 @@ pub enum ResolverIntent {
 pub struct ResolverConfig {
     pub size: u32,
     pub flags: u32,
-    pub reserved: [u64; 6],
+    pub ttl_fast_ms: u64,
+    pub reserved: [u64; 5],
 }
 
 #[repr(C)]
@@ -80,11 +81,28 @@ pub struct ResolverDirGeneration {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct ResolverDirStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct ResolverPlanToken {
     pub size: u32,
     pub op_generation: u64,
+    pub unicode_version_generation: u64,
+    pub root_mapping_generation: u64,
+    pub absolute_path_support_generation: u64,
+    pub encoding_policy_generation: u64,
+    pub symlink_policy_generation: u64,
     pub dir_generations: ResolverBufferView,
-    pub reserved: [u64; 6],
+    pub touched_dir_stamps: ResolverBufferView,
+    pub reserved: [u64; 4],
 }
 
 #[repr(C)]
@@ -94,10 +112,10 @@ pub struct ResolverPlan {
     pub status: ResolverStatus,
     pub would_error: ResolverStatus,
     pub flags: u32,
+    pub intent: ResolverIntent,
     pub resolved_parent: ResolverStringView,
     pub resolved_leaf: ResolverStringView,
     pub plan_token: ResolverPlanToken,
-    // TODO(spec): add plan token fields (generations, dir generations, stamps).
     pub reserved: [u64; 6],
 }
 
@@ -108,18 +126,59 @@ pub struct ResolverResult {
     pub reserved: [u64; 6],
 }
 
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResolverDiagSeverity {
+    Info = 0,
+    Warning = 1,
+    Error = 2,
+}
+
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResolverDiagCode {
+    BackslashNormalized = 1,
+    RootMappingApplied = 2,
+    Collision = 3,
+    InvalidUtf8EntrySkipped = 4,
+    EncodingError = 5,
+    SymlinkLoop = 6,
+    PermissionDenied = 7,
+    UnsupportedAbsolutePath = 8,
+    UnmappedRoot = 9,
+    EscapesRoot = 10,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ResolverDiagEntry {
+    pub code: u32,
+    pub severity: u32,
+    pub context: ResolverStringView,
+    pub detail: ResolverStringView,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct ResolverDiag {
     pub size: u32,
-    pub reserved: [u64; 8],
+    pub entries: ResolverBufferView,
+    pub reserved: [u64; 7],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct ResolverMetrics {
     pub size: u32,
-    pub reserved: [u64; 12],
+    pub dirindex_cache_hits: u64,
+    pub dirindex_cache_misses: u64,
+    pub dirindex_rebuilds: u64,
+    pub stamp_validations: u64,
+    pub collisions: u64,
+    pub invalid_utf8_entries: u64,
+    pub encoding_errors: u64,
+    pub plans_rejected_stale: u64,
+    pub reserved: [u64; 4],
 }
 
 #[repr(C)]

@@ -25,7 +25,8 @@ impl TestResolver {
         let config = ResolverConfig {
             size: std::mem::size_of::<ResolverConfig>() as u32,
             flags,
-            reserved: [0; 6],
+            ttl_fast_ms: 0,
+            reserved: [0; 5],
         };
         let handle = resolver_create(&config);
         Self { handle }
@@ -523,6 +524,7 @@ fn plan_token_stale_after_execute() {
         status: ResolverStatus::Ok,
         would_error: ResolverStatus::Ok,
         flags: 0,
+        intent: ResolverIntent::StatExists,
         resolved_parent: ResolverStringView {
             ptr: std::ptr::null(),
             len: 0,
@@ -534,11 +536,20 @@ fn plan_token_stale_after_execute() {
         plan_token: ResolverPlanToken {
             size: std::mem::size_of::<ResolverPlanToken>() as u32,
             op_generation: 0,
+            unicode_version_generation: 0,
+            root_mapping_generation: 0,
+            absolute_path_support_generation: 0,
+            encoding_policy_generation: 0,
+            symlink_policy_generation: 0,
             dir_generations: ResolverBufferView {
                 ptr: std::ptr::null(),
                 len: 0,
             },
-            reserved: [0; 6],
+            touched_dir_stamps: ResolverBufferView {
+                ptr: std::ptr::null(),
+                len: 0,
+            },
+            reserved: [0; 4],
         },
         reserved: [0; 6],
     };
@@ -631,6 +642,7 @@ fn plan_token_dir_generation_stale_after_mutation() {
         status: ResolverStatus::Ok,
         would_error: ResolverStatus::Ok,
         flags: 0,
+        intent: ResolverIntent::StatExists,
         resolved_parent: ResolverStringView {
             ptr: std::ptr::null(),
             len: 0,
@@ -642,11 +654,20 @@ fn plan_token_dir_generation_stale_after_mutation() {
         plan_token: ResolverPlanToken {
             size: std::mem::size_of::<ResolverPlanToken>() as u32,
             op_generation: 0,
+            unicode_version_generation: 0,
+            root_mapping_generation: 0,
+            absolute_path_support_generation: 0,
+            encoding_policy_generation: 0,
+            symlink_policy_generation: 0,
             dir_generations: ResolverBufferView {
                 ptr: std::ptr::null(),
                 len: 0,
             },
-            reserved: [0; 6],
+            touched_dir_stamps: ResolverBufferView {
+                ptr: std::ptr::null(),
+                len: 0,
+            },
+            reserved: [0; 4],
         },
         reserved: [0; 6],
     };
@@ -668,6 +689,7 @@ fn plan_token_dir_generation_stale_after_mutation() {
         status: ResolverStatus::Ok,
         would_error: ResolverStatus::Ok,
         flags: 0,
+        intent: ResolverIntent::StatExists,
         resolved_parent: ResolverStringView {
             ptr: std::ptr::null(),
             len: 0,
@@ -679,11 +701,20 @@ fn plan_token_dir_generation_stale_after_mutation() {
         plan_token: ResolverPlanToken {
             size: std::mem::size_of::<ResolverPlanToken>() as u32,
             op_generation: 0,
+            unicode_version_generation: 0,
+            root_mapping_generation: 0,
+            absolute_path_support_generation: 0,
+            encoding_policy_generation: 0,
+            symlink_policy_generation: 0,
             dir_generations: ResolverBufferView {
                 ptr: std::ptr::null(),
                 len: 0,
             },
-            reserved: [0; 6],
+            touched_dir_stamps: ResolverBufferView {
+                ptr: std::ptr::null(),
+                len: 0,
+            },
+            reserved: [0; 4],
         },
         reserved: [0; 6],
     };

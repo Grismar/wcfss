@@ -185,6 +185,7 @@ fn init_plan(plan: &mut ResolverPlan) {
     plan.status = ResolverStatus::Ok;
     plan.would_error = ResolverStatus::Ok;
     plan.flags = 0;
+    plan.intent = ResolverIntent::StatExists;
     plan.resolved_parent = ResolverStringView {
         ptr: std::ptr::null(),
         len: 0,
@@ -196,11 +197,20 @@ fn init_plan(plan: &mut ResolverPlan) {
     plan.plan_token = ResolverPlanToken {
         size: std::mem::size_of::<ResolverPlanToken>() as u32,
         op_generation: 0,
+        unicode_version_generation: 0,
+        root_mapping_generation: 0,
+        absolute_path_support_generation: 0,
+        encoding_policy_generation: 0,
+        symlink_policy_generation: 0,
         dir_generations: ResolverBufferView {
             ptr: std::ptr::null(),
             len: 0,
         },
-        reserved: [0; 6],
+        touched_dir_stamps: ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        reserved: [0; 4],
     };
     plan.reserved = [0; 6];
 }
