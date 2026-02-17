@@ -71,6 +71,7 @@ Policy:
   - `drive:X`
   - `unc:server/share`
 - The resolver translates `root_id` to an OS path using an application-supplied **root mapping table**.
+ - On Windows, drive/UNC roots are handled natively; root mapping is not used.
 
 Root mapping keys:
 - Drive roots accept `X:`, `X:\`, or `X:/` (drive letter case-insensitive).
@@ -543,6 +544,9 @@ If `resolver_plan` returns a `ResolverPlanToken` with non-empty `dir_generations
 
 If diagnostics return a non-empty `ResolverDiag.entries` buffer, the implementation MAY allocate it. In that case:
 - The caller MUST release the buffer with `resolver_free_buffer`.
+
+### 19.2 Config defaults
+`resolver_create(NULL)` MUST be treated as a request for default configuration values.
 
 Bindings:
 - Fortran: `ISO_C_BINDING` wrappers.

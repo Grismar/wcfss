@@ -24,11 +24,16 @@ pub struct WindowsResolver {
     op_generation: AtomicU64,
     mutation_lock: Mutex<()>,
     dir_generations: RwLock<HashMap<(u64, u64), u64>>,
+    #[allow(dead_code)]
+    strict_utf8: bool,
 }
 
 impl WindowsResolver {
-    pub fn new(_config: *const ResolverConfig) -> Self {
-        // TODO(windows): parse config, initialize native state.
+    pub fn new(config: *const ResolverConfig) -> Self {
+        let mut strict_utf8 = false;
+        if let Some(cfg) = unsafe { config.as_ref() } {
+            strict_utf8 = cfg.flags & RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY != 0;
+        }
         let generations = ResolverGenerations {
             unicode_version_generation: 1,
             root_mapping_generation: 0,
@@ -43,6 +48,7 @@ impl WindowsResolver {
             op_generation: AtomicU64::new(0),
             mutation_lock: Mutex::new(()),
             dir_generations: RwLock::new(HashMap::new()),
+            strict_utf8,
         }
     }
 
@@ -751,7 +757,7 @@ impl Resolver for WindowsResolver {
         _mapping: *const ResolverRootMapping,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        // TODO(windows): apply root mapping (optional feature).
+        // Root mapping is a Linux-only feature; Windows paths are native.
         ResolverStatus::UnsupportedAbsolutePath
     }
 

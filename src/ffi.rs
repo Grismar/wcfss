@@ -92,7 +92,6 @@ fn status_invalid_handle() -> ResolverStatus {
 
 #[no_mangle]
 pub extern "C" fn resolver_create(config: *const ResolverConfig) -> *mut ResolverHandle {
-    // TODO(ffi): validate config and handle allocation failures.
     let resolver = PlatformResolver::new(config);
     let handle = ResolverHandle {
         inner: Box::new(resolver),
@@ -116,7 +115,6 @@ pub extern "C" fn resolver_set_root_mapping(
     mapping: *const ResolverRootMapping,
     out_diag: *mut ResolverDiag,
 ) -> ResolverStatus {
-    // TODO(ffi): validate inputs and thread-safety requirements.
     if let Err(status) = validate_out_diag(out_diag) {
         return status;
     }

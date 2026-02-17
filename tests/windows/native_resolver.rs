@@ -431,6 +431,89 @@ fn ffi_resolved_path_lifetime_after_plan() {
 }
 
 #[test]
+fn execute_from_plan_read() {
+    let resolver = TestResolver::new();
+    let temp = TempDir::new("plan_read");
+    let file_path = temp.path.join("read.txt");
+    fs::write(&file_path, b"data").expect("write file");
+
+    let base = temp.path.to_string_lossy().into_owned();
+    let (_base_buf, base_view) = make_view(&base);
+    let (_input_buf, input_view) = make_view("read.txt");
+
+    let mut plan: ResolverPlan = unsafe { std::mem::zeroed() };
+    plan.size = std::mem::size_of::<ResolverPlan>() as u32;
+    let status = resolver_plan(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        ResolverIntent::Read,
+        &mut plan,
+        std::ptr::null_mut(),
+    );
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let exec_status = resolver_execute_from_plan(
+        resolver.handle,
+        &plan,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    assert_eq!(exec_status, ResolverStatus::Ok);
+
+    resolver_free_buffer(plan.plan_token.dir_generations);
+    resolver_free_buffer(plan.plan_token.touched_dir_stamps);
+    resolver_free_string(plan.resolved_parent);
+    resolver_free_string(plan.resolved_leaf);
+}
+
+#[test]
+fn execute_from_plan_stale_after_mutation() {
+    let resolver = TestResolver::new();
+    let temp = TempDir::new("plan_stale");
+    let file_path = temp.path.join("stale.txt");
+    fs::write(&file_path, b"data").expect("write file");
+
+    let base = temp.path.to_string_lossy().into_owned();
+    let (_base_buf, base_view) = make_view(&base);
+    let (_input_buf, input_view) = make_view("stale.txt");
+
+    let mut plan: ResolverPlan = unsafe { std::mem::zeroed() };
+    plan.size = std::mem::size_of::<ResolverPlan>() as u32;
+    let status = resolver_plan(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        ResolverIntent::Read,
+        &mut plan,
+        std::ptr::null_mut(),
+    );
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let unlink_status = resolver_execute_unlink(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    assert_eq!(unlink_status, ResolverStatus::Ok);
+
+    let exec_status = resolver_execute_from_plan(
+        resolver.handle,
+        &plan,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    assert_eq!(exec_status, ResolverStatus::StalePlan);
+
+    resolver_free_buffer(plan.plan_token.dir_generations);
+    resolver_free_buffer(plan.plan_token.touched_dir_stamps);
+    resolver_free_string(plan.resolved_parent);
+    resolver_free_string(plan.resolved_leaf);
+}
+
+#[test]
 fn ffi_free_after_destroy() {
     let resolver = TestResolver::new();
     let temp = TempDir::new("ffi_free_after_destroy");

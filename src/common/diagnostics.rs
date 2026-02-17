@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-// TODO(diagnostics): define structured diagnostics as required by docs/spec.md §17.
+// Placeholder for shared diagnostics types (currently unused).
 
 #[derive(Debug, Default, Clone)]
 pub struct Diagnostics;

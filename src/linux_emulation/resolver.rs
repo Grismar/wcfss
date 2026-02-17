@@ -318,8 +318,8 @@ fn write_plan_dir_generations(
     plan: &mut ResolverPlan,
     trace: &PlanTrace,
 ) -> Result<(), ResolverStatus> {
-    // TODO(sync): caller is responsible for freeing any previous plan_token buffer
-    // via resolver_free_buffer before reusing the plan.
+    // Caller must free any previous plan_token buffer via resolver_free_buffer
+    // before reusing the plan.
     if trace.dir_generations.is_empty() {
         plan.plan_token.dir_generations = ResolverBufferView {
             ptr: std::ptr::null(),

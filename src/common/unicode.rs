@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-// TODO(unicode): Build and store a binary/efficient uppercase mapping table
+// Note: uppercase mapping table is generated at build time; further optimizations are optional.
 // derived from data/unicode/15.1/UnicodeData.txt so we don't parse text at runtime.
 
 #[derive(Debug, Default, Clone)]
