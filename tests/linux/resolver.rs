@@ -184,6 +184,36 @@ fn bump_root_mapping_generation(resolver: &TestResolver) -> ResolverStatus {
     resolver_set_root_mapping(resolver.handle, &mapping, std::ptr::null_mut())
 }
 
+fn set_root_mapping(resolver: &TestResolver, entries: &[(&str, &str)]) -> ResolverStatus {
+    let mut buffers: Vec<Vec<u8>> = Vec::new();
+    let mut mapping_entries: Vec<ResolverRootMappingEntry> = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        let key_bytes = key.as_bytes().to_vec();
+        let value_bytes = value.as_bytes().to_vec();
+        let key_view = ResolverStringView {
+            ptr: key_bytes.as_ptr() as *const c_char,
+            len: key_bytes.len(),
+        };
+        let value_view = ResolverStringView {
+            ptr: value_bytes.as_ptr() as *const c_char,
+            len: value_bytes.len(),
+        };
+        buffers.push(key_bytes);
+        buffers.push(value_bytes);
+        mapping_entries.push(ResolverRootMappingEntry {
+            key: key_view,
+            value: value_view,
+        });
+    }
+    let mapping = ResolverRootMapping {
+        entries: mapping_entries.as_ptr(),
+        len: mapping_entries.len(),
+    };
+    let status = resolver_set_root_mapping(resolver.handle, &mapping, std::ptr::null_mut());
+    drop(buffers);
+    status
+}
+
 fn assert_path_ends_with(resolved: &str, tail: &Path) {
     let resolved_path = Path::new(resolved);
     assert!(
@@ -191,6 +221,16 @@ fn assert_path_ends_with(resolved: &str, tail: &Path) {
         "expected {:?} to end with {:?}",
         resolved_path,
         tail
+    );
+}
+
+fn assert_path_starts_with(resolved: &str, head: &Path) {
+    let resolved_path = Path::new(resolved);
+    assert!(
+        resolved_path.starts_with(head),
+        "expected {:?} to start with {:?}",
+        resolved_path,
+        head
     );
 }
 
@@ -381,6 +421,79 @@ fn dirindex_generation_invalidation_clears_cache() {
         .err()
         .unwrap_or(ResolverStatus::Ok);
     assert_eq!(status, ResolverStatus::Collision);
+}
+
+#[test]
+fn root_mapping_disabled_rejects_windows_paths() {
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("root_mapping_disabled");
+    let base = temp.path.to_string_lossy().into_owned();
+    let status = open_return_path(&resolver, &base, "C:\\file.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::UnsupportedAbsolutePath);
+}
+
+#[test]
+fn root_mapping_unmapped_root_returns_unmapped() {
+    let resolver = TestResolver::new(RESOLVER_FLAG_ENABLE_WINDOWS_ABSOLUTE_PATHS);
+    let temp = TempDir::new("root_mapping_unmapped");
+    let base = temp.path.to_string_lossy().into_owned();
+    let status = open_return_path(&resolver, &base, "C:\\file.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::UnmappedRoot);
+}
+
+#[test]
+fn root_mapping_drive_letter_maps_to_linux_root() {
+    let resolver = TestResolver::new(RESOLVER_FLAG_ENABLE_WINDOWS_ABSOLUTE_PATHS);
+    let temp = TempDir::new("root_mapping_drive");
+    let root = temp.path.join("DriveRoot");
+    fs::create_dir_all(&root).expect("create root");
+    fs::create_dir_all(root.join("Sub")).expect("create Sub");
+    fs::write(root.join("Sub").join("File.txt"), b"data").expect("write file");
+
+    let status = set_root_mapping(&resolver, &[("C:", root.to_string_lossy().as_ref())]);
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let base = temp.path.to_string_lossy().into_owned();
+    let resolved = open_return_path(
+        &resolver,
+        &base,
+        "C:\\Sub\\File.txt",
+        ResolverIntent::Read,
+    )
+    .expect("resolve via drive mapping");
+    assert_path_starts_with(&resolved, &root);
+    assert_path_ends_with(&resolved, Path::new("Sub/File.txt"));
+}
+
+#[test]
+fn root_mapping_unc_maps_to_linux_root() {
+    let resolver = TestResolver::new(RESOLVER_FLAG_ENABLE_WINDOWS_ABSOLUTE_PATHS);
+    let temp = TempDir::new("root_mapping_unc");
+    let root = temp.path.join("UncRoot");
+    fs::create_dir_all(&root).expect("create root");
+    fs::create_dir_all(root.join("Dir")).expect("create Dir");
+    fs::write(root.join("Dir").join("File.txt"), b"data").expect("write file");
+
+    let status = set_root_mapping(
+        &resolver,
+        &[("\\\\Server\\Share", root.to_string_lossy().as_ref())],
+    );
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let base = temp.path.to_string_lossy().into_owned();
+    let resolved = open_return_path(
+        &resolver,
+        &base,
+        "\\\\server\\share\\Dir\\File.txt",
+        ResolverIntent::Read,
+    )
+    .expect("resolve via UNC mapping");
+    assert_path_starts_with(&resolved, &root);
+    assert_path_ends_with(&resolved, Path::new("Dir/File.txt"));
 }
 
 #[test]

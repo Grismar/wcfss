@@ -24,8 +24,6 @@ pub struct WindowsResolver {
     op_generation: AtomicU64,
     mutation_lock: Mutex<()>,
     dir_generations: RwLock<HashMap<(u64, u64), u64>>,
-    #[allow(dead_code)]
-    strict_utf8: bool,
 }
 
 impl WindowsResolver {
@@ -38,7 +36,7 @@ impl WindowsResolver {
             unicode_version_generation: 1,
             root_mapping_generation: 0,
             absolute_path_support_generation: 1,
-            encoding_policy_generation: 0,
+            encoding_policy_generation: if strict_utf8 { 1 } else { 0 },
             symlink_policy_generation: 0,
         };
         Self {
@@ -48,7 +46,6 @@ impl WindowsResolver {
             op_generation: AtomicU64::new(0),
             mutation_lock: Mutex::new(()),
             dir_generations: RwLock::new(HashMap::new()),
-            strict_utf8,
         }
     }
 

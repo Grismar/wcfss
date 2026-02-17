@@ -47,15 +47,10 @@ impl DirStamp {
 #[derive(Debug, Clone)]
 pub struct DirIndex {
     pub dir_id: (u64, u64),
-    #[allow(dead_code)]
     pub diag_path: String,
     pub fold_map: HashMap<String, EntrySet>,
     pub stamp: DirStamp,
     pub built_at: Instant,
-    #[allow(dead_code)]
-    pub dir_index_generation: u64,
-    #[allow(dead_code)]
-    pub dir_generation: u64,
 }
 
 pub fn insert_entry(map: &mut HashMap<String, EntrySet>, key: String, name: String) -> bool {

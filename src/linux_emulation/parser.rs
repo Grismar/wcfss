@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::common::types::ResolverStatus;
 
 include!(concat!(env!("OUT_DIR"), "/unicode15_1_upper.rs"));

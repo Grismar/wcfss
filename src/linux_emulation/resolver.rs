@@ -128,8 +128,6 @@ fn base_dir_from_view(view: *const ResolverStringView) -> Result<String, Resolve
 fn build_dir_index(
     dir: &Path,
     strict_utf8: bool,
-    dir_index_generation: u64,
-    dir_generation: u64,
     mut diag: Option<&mut DiagCollector>,
     metrics: &MetricsCounters,
 ) -> Result<DirIndex, ResolverStatus> {
@@ -207,8 +205,6 @@ fn build_dir_index(
         fold_map: map,
         stamp,
         built_at: Instant::now(),
-        dir_index_generation,
-        dir_generation,
     })
 }
 
@@ -1336,14 +1332,7 @@ impl LinuxResolver {
             trace("DirIndex cache miss; building.");
         }
 
-        let index = build_dir_index(
-            dir,
-            self.strict_utf8,
-            self.current_dir_index_generation(),
-            dir_generation,
-            diag,
-            &self.metrics,
-        )?;
+        let index = build_dir_index(dir, self.strict_utf8, diag, &self.metrics)?;
         self.metrics
             .dirindex_rebuilds
             .fetch_add(1, Ordering::SeqCst);

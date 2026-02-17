@@ -608,10 +608,10 @@ The resolver operates in two distinct modes depending on the target platform:
 
 **Windows (Native Mode):**
 - The resolver is a thin wrapper around Win32 APIs (FindFirstFileW/FindNextFileW, CreateFileW, MoveFileExW, etc.)
-- Case-insensitive behavior, collision handling, and path semantics are delegated directly to NTFS/ReFS, **except** the resolver enforces `base_dir` confinement for relative paths (attempts to traverse above `base_dir` via `..` MUST fail with `ESCAPES_ROOT`).
-- DirIndex caching is NOT used (Windows filesystem already provides efficient case-insensitive lookups)
-- All operations use native Windows path handling
-- The complex resolution logic described in §9-13 is NOT implemented on Windows
+- Case-insensitive behavior and collision handling are validated by enumerating directory entries using Win32 APIs; the filesystem’s case-insensitive lookups are not relied upon for ambiguity detection.
+- The resolver enforces `base_dir` confinement for relative paths (attempts to traverse above `base_dir` via `..` MUST fail with `ESCAPES_ROOT`) and applies the strict `..` cancellation rules (§7.4.1) when needed.
+- DirIndex caching is NOT used (Windows uses per-lookup enumeration instead of persistent DirIndex).
+- All operations use native Windows path handling; Linux emulation implements the full caching/DirIndex machinery for equivalence.
 
 **Linux (Emulation Mode):**
 - The resolver implements full DirIndex caching and case-insensitive resolution logic per §9-13
