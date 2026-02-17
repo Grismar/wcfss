@@ -25,6 +25,12 @@ fn trace(msg: &str) {
     eprintln!("[wcfss][linux] {msg}");
 }
 
+#[derive(Debug)]
+struct ComponentSelection {
+    name: String,
+    meta: fs::Metadata,
+}
+
 fn map_io_error(err: &io::Error) -> ResolverStatus {
     use io::ErrorKind;
     if let Some(code) = err.raw_os_error() {
@@ -257,6 +263,12 @@ struct ResolvedInfo {
     would_truncate: bool,
 }
 
+#[derive(Debug)]
+struct MkdirPlan {
+    final_path: PathBuf,
+    create_paths: Vec<PathBuf>,
+}
+
 fn parse_ttl_fast() -> Duration {
     match std::env::var("WCFSS_TTL_FAST_MS") {
         Ok(value) => value
@@ -265,6 +277,40 @@ fn parse_ttl_fast() -> Duration {
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_millis(DEFAULT_TTL_FAST_MS)),
         Err(_) => Duration::from_millis(DEFAULT_TTL_FAST_MS),
+    }
+}
+
+fn select_component(
+    resolver: &LinuxResolver,
+    current: &Path,
+    component: &str,
+) -> Result<Option<ComponentSelection>, ResolverStatus> {
+    let exact_path = current.join(component);
+    match fs::symlink_metadata(&exact_path) {
+        Ok(meta) => Ok(Some(ComponentSelection {
+            name: component.to_string(),
+            meta,
+        })),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let index = resolver.get_dir_index(current)?;
+            let key = parser::key_simple_uppercase(component);
+            match index.fold_map.get(&key) {
+                None => Ok(None),
+                Some(EntrySet::Ambiguous(list)) => {
+                    trace(&format!("DirIndex collision for key '{}': {:?}", key, list));
+                    Err(ResolverStatus::Collision)
+                }
+                Some(EntrySet::Unique(actual)) => {
+                    let path = current.join(actual);
+                    let meta = fs::symlink_metadata(&path).map_err(|err| map_io_error(&err))?;
+                    Ok(Some(ComponentSelection {
+                        name: actual.clone(),
+                        meta,
+                    }))
+                }
+            }
+        }
+        Err(err) => Err(map_io_error(&err)),
     }
 }
 
@@ -316,6 +362,7 @@ fn resolve_path(
     let mut symlink_depth = 0usize;
 
     let mut mkdirs_creates = false;
+    let mut creating = false;
 
     for (idx, component) in components.iter().enumerate() {
         if *component == ".." {
@@ -337,71 +384,24 @@ fn resolve_path(
             component,
             current.display()
         ));
-        let exact_path = current.join(component);
-        let exact_meta = fs::symlink_metadata(&exact_path);
-        let (selected_name, selected_meta, missing_component) = match exact_meta {
-            Ok(meta) => {
-                trace("Exact match found.");
-                trace("Checking for case-insensitive collisions after exact match.");
-                let index = resolver.get_dir_index(&current)?;
-                let key = parser::key_simple_uppercase(component);
-                match index.fold_map.get(&key) {
-                    None => {
-                        trace("DirIndex had no entry for exact-match key; proceeding.");
-                    }
-                    Some(EntrySet::Ambiguous(list)) => {
-                        trace(&format!(
-                            "DirIndex collision for exact match key '{}': {:?}",
-                            key, list
-                        ));
-                        // TODO(diagnostics): include collision payload (dir path, component, names).
-                        return Err(ResolverStatus::Collision);
-                    }
-                    Some(EntrySet::Unique(actual)) => {
-                        trace(&format!(
-                            "DirIndex unique match for exact key '{}': '{}'",
-                            key, actual
-                        ));
-                    }
-                }
-                (component.to_string(), meta, false)
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                trace("Exact match not found; building temporary DirIndex.");
-                let index = resolver.get_dir_index(&current)?;
-                let key = parser::key_simple_uppercase(component);
-                match index.fold_map.get(&key) {
-                    None => {
-                        trace("DirIndex had no match for component.");
-                        if intent == ResolverIntent::Mkdirs {
-                            let fake_meta =
-                                fs::symlink_metadata(&current).map_err(|err| map_io_error(&err))?;
-                            (component.to_string(), fake_meta, true)
-                        } else {
-                            return Err(ResolverStatus::NotFound);
-                        }
-                    }
-                    Some(EntrySet::Ambiguous(list)) => {
-                        trace(&format!("DirIndex collision for key '{}': {:?}", key, list));
-                        // TODO(diagnostics): include collision payload (dir path, component, names).
-                        return Err(ResolverStatus::Collision);
-                    }
-                    Some(EntrySet::Unique(actual)) => {
-                        trace(&format!("DirIndex resolved to '{}'.", actual));
-                        let path = current.join(actual);
-                        let meta = fs::symlink_metadata(&path).map_err(|err| map_io_error(&err))?;
-                        (actual.clone(), meta, false)
-                    }
-                }
-            }
-            Err(err) => {
-                trace(&format!("Exact lookup error: {err}"));
-                return Err(map_io_error(&err));
+        let selection = if intent == ResolverIntent::Mkdirs && creating {
+            None
+        } else {
+            match select_component(resolver, &current, component) {
+                Ok(value) => value,
+                Err(status) => return Err(status),
             }
         };
 
+        let (selected_name, selected_meta, missing_component) = match selection {
+            Some(entry) => (entry.name, Some(entry.meta), false),
+            None => (component.to_string(), None, true),
+        };
+
         let next_path = current.join(&selected_name);
-        if !missing_component && selected_meta.file_type().is_symlink() {
+        if !missing_component {
+            let selected_meta = selected_meta.as_ref().expect("meta for existing entry");
+            if selected_meta.file_type().is_symlink() {
             trace(&format!("Encountered symlink: {}", next_path.display()));
             let dev = selected_meta.dev();
             let ino = selected_meta.ino();
@@ -424,13 +424,19 @@ fn resolve_path(
                 "Symlink visit recorded (depth={}, dev={}, ino={}).",
                 symlink_depth, dev, ino
             ));
+            }
         }
 
         let is_last = idx + 1 == components.len();
         if !is_last {
             if missing_component {
-                mkdirs_creates = true;
-                trace("Intermediate component will be created for mkdirs.");
+                if intent == ResolverIntent::Mkdirs {
+                    creating = true;
+                    mkdirs_creates = true;
+                    trace("Intermediate component will be created for mkdirs.");
+                } else {
+                    return Err(ResolverStatus::NotFound);
+                }
             } else {
                 let meta = fs::metadata(&next_path).map_err(|err| map_io_error(&err))?;
                 if !meta.is_dir() {
@@ -440,21 +446,25 @@ fn resolve_path(
             }
             stack.push((
                 next_path.clone(),
-                !missing_component && selected_meta.file_type().is_symlink(),
+                !missing_component
+                    && selected_meta
+                        .as_ref()
+                        .map(|meta| meta.file_type().is_symlink())
+                        .unwrap_or(false),
             ));
             current = next_path;
             continue;
         }
 
-        let meta_follow = if missing_component {
-            Err(io::Error::new(io::ErrorKind::NotFound, "missing leaf"))
+        let (target_exists, target_is_dir) = if missing_component {
+            (false, false)
         } else {
-            fs::metadata(&next_path)
-        };
-        let (target_exists, target_is_dir) = match meta_follow {
-            Ok(meta) => (true, meta.is_dir()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => (false, false),
-            Err(err) => return Err(map_io_error(&err)),
+            let meta_follow = fs::metadata(&next_path);
+            match meta_follow {
+                Ok(meta) => (true, meta.is_dir()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => (false, false),
+                Err(err) => return Err(map_io_error(&err)),
+            }
         };
 
         let mut would_create = false;
@@ -508,12 +518,177 @@ fn resolve_path(
     Err(ResolverStatus::InvalidPath)
 }
 
+fn plan_mkdirs(
+    resolver: &LinuxResolver,
+    base_dir: &Path,
+    input_path: &str,
+) -> Result<MkdirPlan, ResolverStatus> {
+    if input_path.as_bytes().len() > MAX_INPUT_PATH_BYTES {
+        return Err(ResolverStatus::PathTooLong);
+    }
+
+    let (normalized, had_backslash) = normalize_input(input_path);
+    if had_backslash {
+        trace("Input contained backslashes; normalized to forward slashes.");
+    }
+
+    let root = classify_root(&normalized)?;
+    let mut current = root.unwrap_or_else(|| base_dir.to_path_buf());
+    let mut stack: Vec<(PathBuf, bool)> = vec![(current.clone(), false)];
+
+    let mut components: Vec<&str> = Vec::new();
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part.as_bytes().len() > MAX_COMPONENT_BYTES {
+            return Err(ResolverStatus::PathTooLong);
+        }
+        components.push(part);
+        if components.len() > MAX_COMPONENTS {
+            return Err(ResolverStatus::PathTooLong);
+        }
+    }
+
+    if components.is_empty() {
+        return Ok(MkdirPlan {
+            final_path: current,
+            create_paths: Vec::new(),
+        });
+    }
+
+    let mut visited_symlinks: HashSet<(u64, u64)> = HashSet::new();
+    let mut symlink_depth = 0usize;
+    let mut create_paths: Vec<PathBuf> = Vec::new();
+    let mut creating = false;
+
+    for (idx, component) in components.iter().enumerate() {
+        if *component == ".." {
+            if stack.len() <= 1 {
+                trace("Encountered .. at root boundary.");
+                return Err(ResolverStatus::EscapesRoot);
+            }
+            let (_, was_symlink) = stack.pop().unwrap();
+            if was_symlink {
+                trace("Encountered .. across symlink boundary.");
+                return Err(ResolverStatus::InvalidPath);
+            }
+            current = stack.last().unwrap().0.clone();
+            continue;
+        }
+
+        if creating {
+            let next_path = current.join(component);
+            create_paths.push(next_path.clone());
+            stack.push((next_path.clone(), false));
+            current = next_path.clone();
+            if idx + 1 == components.len() {
+                return Ok(MkdirPlan {
+                    final_path: next_path,
+                    create_paths,
+                });
+            }
+            continue;
+        }
+
+        trace(&format!(
+            "Planning mkdirs component '{}' in {}",
+            component,
+            current.display()
+        ));
+
+        let selection = match select_component(resolver, &current, component) {
+            Ok(value) => value,
+            Err(status) => return Err(status),
+        };
+
+        let (selected_name, selected_meta, missing_component) = match selection {
+            Some(entry) => (entry.name, Some(entry.meta), false),
+            None => (component.to_string(), None, true),
+        };
+
+        let next_path = current.join(&selected_name);
+        if !missing_component {
+            let selected_meta = selected_meta.as_ref().expect("meta for existing entry");
+            if selected_meta.file_type().is_symlink() {
+                trace(&format!("Encountered symlink: {}", next_path.display()));
+                let dev = selected_meta.dev();
+                let ino = selected_meta.ino();
+                if visited_symlinks.contains(&(dev, ino)) {
+                    trace(&format!(
+                        "Symlink cycle detected at dev={}, ino={}.",
+                        dev, ino
+                    ));
+                    return Err(ResolverStatus::TooManySymlinks);
+                }
+                if symlink_depth >= SYMLINK_DEPTH_LIMIT {
+                    trace(&format!(
+                        "Symlink depth limit exceeded (limit={SYMLINK_DEPTH_LIMIT})."
+                    ));
+                    return Err(ResolverStatus::TooManySymlinks);
+                }
+                visited_symlinks.insert((dev, ino));
+                symlink_depth += 1;
+                trace(&format!(
+                    "Symlink visit recorded (depth={}, dev={}, ino={}).",
+                    symlink_depth, dev, ino
+                ));
+            }
+        }
+
+        let is_last = idx + 1 == components.len();
+        if !is_last {
+            if missing_component {
+                create_paths.push(next_path.clone());
+                creating = true;
+                stack.push((next_path.clone(), false));
+                current = next_path;
+                continue;
+            }
+            let meta = fs::metadata(&next_path).map_err(|err| map_io_error(&err))?;
+            if !meta.is_dir() {
+                trace("Intermediate component is not a directory.");
+                return Err(ResolverStatus::NotADirectory);
+            }
+            stack.push((
+                next_path.clone(),
+                selected_meta
+                    .as_ref()
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false),
+            ));
+            current = next_path;
+            continue;
+        }
+
+        if missing_component {
+            create_paths.push(next_path.clone());
+            return Ok(MkdirPlan {
+                final_path: next_path,
+                create_paths,
+            });
+        }
+
+        let meta = fs::metadata(&next_path).map_err(|err| map_io_error(&err))?;
+        if !meta.is_dir() {
+            return Err(ResolverStatus::NotADirectory);
+        }
+        return Ok(MkdirPlan {
+            final_path: next_path,
+            create_paths,
+        });
+    }
+
+    Err(ResolverStatus::InvalidPath)
+}
+
 pub struct LinuxResolver {
     strict_utf8: bool,
     ttl_fast: Duration,
     cache: RefCell<DirIndexCache>,
     generations: Cell<ResolverGenerations>,
     cache_generation: Cell<u64>,
+    op_generation: Cell<u64>,
 }
 
 // Safety: LinuxResolver uses interior mutability and is not synchronized.
@@ -544,6 +719,7 @@ impl LinuxResolver {
             cache: RefCell::new(DirIndexCache::new(DEFAULT_CACHE_MAX_ENTRIES)),
             generations: Cell::new(generations),
             cache_generation: Cell::new(cache_generation),
+            op_generation: Cell::new(0),
         }
     }
 
@@ -593,6 +769,18 @@ impl LinuxResolver {
         let mut cache = self.cache.borrow_mut();
         cache.insert(index.clone());
         Ok(index)
+    }
+
+    fn bump_op_generation(&self) {
+        let value = self.op_generation.get().wrapping_add(1);
+        self.op_generation.set(value);
+    }
+
+    fn invalidate_dir_index(&self, dir: &Path) {
+        if let Ok(meta) = fs::metadata(dir) {
+            let dir_id = (meta.dev(), meta.ino());
+            self.cache.borrow_mut().remove(&dir_id);
+        }
     }
 }
 
@@ -697,6 +885,7 @@ impl Resolver for LinuxResolver {
         out_result: *mut ResolverResult,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
+        self.bump_op_generation();
         let base_dir = match string_view_to_string(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
@@ -715,37 +904,124 @@ impl Resolver for LinuxResolver {
             out.reserved = [0; 6];
         }
 
-        let info = match resolve_path(self, &base_dir_path, &input_path, ResolverIntent::Mkdirs) {
+        let plan = match plan_mkdirs(self, &base_dir_path, &input_path) {
             Ok(value) => value,
             Err(status) => return status,
         };
 
-        if info.target_exists {
+        if plan.create_paths.is_empty() {
             return ResolverStatus::Ok;
         }
 
-        trace(&format!(
-            "execute_mkdirs creating path '{}'",
-            info.path.display()
-        ));
-        if let Err(err) = fs::create_dir_all(&info.path) {
-            return map_io_error(&err);
+        let mut parents_to_invalidate: HashSet<PathBuf> = HashSet::new();
+        for create_path in &plan.create_paths {
+            if let Some(parent) = create_path.parent() {
+                parents_to_invalidate.insert(parent.to_path_buf());
+            }
         }
-        // TODO(cache): invalidate only affected directories once per-directory generation exists.
-        self.cache.borrow_mut().clear();
+
+        trace(&format!(
+            "execute_mkdirs creating {} path(s), final '{}'",
+            plan.create_paths.len(),
+            plan.final_path.display()
+        ));
+
+        for create_path in &plan.create_paths {
+            match fs::create_dir(create_path) {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    let meta = match fs::metadata(create_path) {
+                        Ok(meta) => meta,
+                        Err(err) => {
+                            for parent in &parents_to_invalidate {
+                                self.invalidate_dir_index(parent);
+                            }
+                            return map_io_error(&err);
+                        }
+                    };
+                    if !meta.is_dir() {
+                        for parent in &parents_to_invalidate {
+                            self.invalidate_dir_index(parent);
+                        }
+                        return ResolverStatus::NotADirectory;
+                    }
+                }
+                Err(err) => {
+                    for parent in &parents_to_invalidate {
+                        self.invalidate_dir_index(parent);
+                    }
+                    return map_io_error(&err);
+                }
+            }
+        }
+
+        for parent in &parents_to_invalidate {
+            self.invalidate_dir_index(parent);
+        }
+
         ResolverStatus::Ok
     }
 
     fn execute_rename(
         &self,
-        _base_dir: *const ResolverStringView,
-        _from_path: *const ResolverStringView,
-        _to_path: *const ResolverStringView,
-        _out_result: *mut ResolverResult,
+        base_dir: *const ResolverStringView,
+        from_path: *const ResolverStringView,
+        to_path: *const ResolverStringView,
+        out_result: *mut ResolverResult,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        // TODO(linux): implement rename/move with invalidation.
-        ResolverStatus::IoError
+        self.bump_op_generation();
+        let base_dir = match string_view_to_string(base_dir) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let from_path = match string_view_to_string(from_path) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let to_path = match string_view_to_string(to_path) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let base_dir_path = match validate_base_dir(&base_dir) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+
+        if let Some(out) = unsafe { out_result.as_mut() } {
+            out.size = std::mem::size_of::<ResolverResult>() as u32;
+            out.reserved = [0; 6];
+        }
+
+        let source = match resolve_path(self, &base_dir_path, &from_path, ResolverIntent::Read) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+
+        let destination =
+            match resolve_path(self, &base_dir_path, &to_path, ResolverIntent::WriteTruncate) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+
+        trace(&format!(
+            "execute_rename '{}' -> '{}'",
+            source.path.display(),
+            destination.path.display()
+        ));
+
+        if let Err(err) = fs::rename(&source.path, &destination.path) {
+            return map_io_error(&err);
+        }
+
+        if let Some(parent) = source.path.parent() {
+            self.invalidate_dir_index(parent);
+        }
+        if let Some(parent) = destination.path.parent() {
+            self.invalidate_dir_index(parent);
+        }
+
+        ResolverStatus::Ok
     }
 
     fn execute_unlink(
@@ -755,6 +1031,7 @@ impl Resolver for LinuxResolver {
         out_result: *mut ResolverResult,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
+        self.bump_op_generation();
         let base_dir = match string_view_to_string(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
@@ -788,8 +1065,9 @@ impl Resolver for LinuxResolver {
         if let Err(err) = fs::remove_file(&info.path) {
             return map_io_error(&err);
         }
-        // TODO(cache): invalidate only affected directories once per-directory generation exists.
-        self.cache.borrow_mut().clear();
+        if let Some(parent) = info.path.parent() {
+            self.invalidate_dir_index(parent);
+        }
         ResolverStatus::Ok
     }
 
@@ -855,6 +1133,13 @@ impl Resolver for LinuxResolver {
         if out_fd.is_null() {
             return ResolverStatus::InvalidPath;
         }
+        let mutating_intent = matches!(
+            intent,
+            ResolverIntent::WriteAppend | ResolverIntent::WriteTruncate | ResolverIntent::CreateNew
+        );
+        if mutating_intent {
+            self.bump_op_generation();
+        }
         let base_dir = match string_view_to_string(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
@@ -890,12 +1175,10 @@ impl Resolver for LinuxResolver {
             let err = io::Error::last_os_error();
             return map_io_error(&err);
         }
-        if matches!(
-            intent,
-            ResolverIntent::WriteAppend | ResolverIntent::WriteTruncate | ResolverIntent::CreateNew
-        ) {
-            // TODO(cache): invalidate only affected directories once per-directory generation exists.
-            self.cache.borrow_mut().clear();
+        if info.would_create {
+            if let Some(parent) = info.path.parent() {
+                self.invalidate_dir_index(parent);
+            }
         }
         unsafe {
             *out_fd = fd;

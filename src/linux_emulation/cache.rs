@@ -29,6 +29,10 @@ impl DirIndexCache {
         self.evict_if_needed();
     }
 
+    pub fn remove(&mut self, key: &(u64, u64)) {
+        self.entries.remove(key);
+    }
+
     fn evict_if_needed(&mut self) {
         if self.entries.len() <= self.max_entries {
             return;

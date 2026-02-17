@@ -96,6 +96,80 @@ fn open_return_path(
     Ok(value)
 }
 
+fn open_return_fd(
+    resolver: &TestResolver,
+    base_dir: &str,
+    input_path: &str,
+    intent: ResolverIntent,
+) -> Result<i32, ResolverStatus> {
+    let (_base_buf, base_view) = make_view(base_dir);
+    let (_input_buf, input_view) = make_view(input_path);
+    let mut fd: i32 = -1;
+    let status = resolver_execute_open_return_fd(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        intent,
+        &mut fd,
+        std::ptr::null_mut(),
+    );
+    if status != ResolverStatus::Ok {
+        return Err(status);
+    }
+    Ok(fd)
+}
+
+fn execute_mkdirs(
+    resolver: &TestResolver,
+    base_dir: &str,
+    input_path: &str,
+) -> ResolverStatus {
+    let (_base_buf, base_view) = make_view(base_dir);
+    let (_input_buf, input_view) = make_view(input_path);
+    resolver_execute_mkdirs(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    )
+}
+
+fn execute_rename(
+    resolver: &TestResolver,
+    base_dir: &str,
+    from_path: &str,
+    to_path: &str,
+) -> ResolverStatus {
+    let (_base_buf, base_view) = make_view(base_dir);
+    let (_from_buf, from_view) = make_view(from_path);
+    let (_to_buf, to_view) = make_view(to_path);
+    resolver_execute_rename(
+        resolver.handle,
+        &base_view,
+        &from_view,
+        &to_view,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    )
+}
+
+fn execute_unlink(
+    resolver: &TestResolver,
+    base_dir: &str,
+    input_path: &str,
+) -> ResolverStatus {
+    let (_base_buf, base_view) = make_view(base_dir);
+    let (_input_buf, input_view) = make_view(input_path);
+    resolver_execute_unlink(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    )
+}
+
 fn bump_root_mapping_generation(resolver: &TestResolver) -> ResolverStatus {
     let mapping = ResolverRootMapping {
         entries: std::ptr::null(),
@@ -167,10 +241,9 @@ fn collision_detection_exact_match() {
         Err(err) => panic!("unexpected error creating second entry: {err}"),
     }
 
-    let status = open_return_path(&resolver, &base, "Bar.txt", ResolverIntent::Read)
-        .err()
-        .unwrap_or(ResolverStatus::Ok);
-    assert_eq!(status, ResolverStatus::Collision);
+    let resolved =
+        open_return_path(&resolver, &base, "Bar.txt", ResolverIntent::Read).unwrap();
+    assert_path_ends_with(&resolved, Path::new("Bar.txt"));
 }
 
 #[test]
@@ -242,7 +315,7 @@ fn dirindex_ttl_refresh_detects_changes() {
 
     let first = temp.path.join("Ttl.txt");
     fs::write(&first, b"one").expect("create Ttl.txt");
-    let resolved = open_return_path(&resolver, &base, "Ttl.txt", ResolverIntent::Read)
+    let resolved = open_return_path(&resolver, &base, "TTL.txt", ResolverIntent::Read)
         .expect("resolve before collision");
     assert_path_ends_with(&resolved, Path::new("Ttl.txt"));
 
@@ -259,7 +332,7 @@ fn dirindex_ttl_refresh_detects_changes() {
         Err(err) => panic!("unexpected error creating second entry: {err}"),
     }
 
-    let status = open_return_path(&resolver, &base, "Ttl.txt", ResolverIntent::Read)
+    let status = open_return_path(&resolver, &base, "TTL.txt", ResolverIntent::Read)
         .err()
         .unwrap_or(ResolverStatus::Ok);
     assert_eq!(status, ResolverStatus::Collision);
@@ -274,7 +347,7 @@ fn dirindex_generation_invalidation_clears_cache() {
 
     let first = temp.path.join("Gen.txt");
     fs::write(&first, b"one").expect("create Gen.txt");
-    let resolved = open_return_path(&resolver, &base, "Gen.txt", ResolverIntent::Read)
+    let resolved = open_return_path(&resolver, &base, "GEN.txt", ResolverIntent::Read)
         .expect("resolve before collision");
     assert_path_ends_with(&resolved, Path::new("Gen.txt"));
 
@@ -290,7 +363,7 @@ fn dirindex_generation_invalidation_clears_cache() {
         Err(err) => panic!("unexpected error creating second entry: {err}"),
     }
 
-    let status = open_return_path(&resolver, &base, "Gen.txt", ResolverIntent::Read)
+    let status = open_return_path(&resolver, &base, "GEN.txt", ResolverIntent::Read)
         .err()
         .unwrap_or(ResolverStatus::Ok);
     assert_eq!(status, ResolverStatus::Ok);
@@ -298,7 +371,7 @@ fn dirindex_generation_invalidation_clears_cache() {
     let bump_status = bump_root_mapping_generation(&resolver);
     assert_eq!(bump_status, ResolverStatus::Ok);
 
-    let status = open_return_path(&resolver, &base, "Gen.txt", ResolverIntent::Read)
+    let status = open_return_path(&resolver, &base, "GEN.txt", ResolverIntent::Read)
         .err()
         .unwrap_or(ResolverStatus::Ok);
     assert_eq!(status, ResolverStatus::Collision);
@@ -335,4 +408,98 @@ fn invalid_utf8_entries_skip_or_fail() {
             .err()
             .unwrap_or(ResolverStatus::Ok);
     assert_eq!(status, ResolverStatus::EncodingError);
+}
+
+#[test]
+fn cache_invalidation_after_create() {
+    std::env::set_var("WCFSS_TTL_FAST_MS", "10_000");
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("invalidate_create");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    fs::write(temp.path.join("Seed.txt"), b"seed").expect("write seed file");
+    let _ = open_return_path(&resolver, &base, "SEED.txt", ResolverIntent::Read)
+        .expect("warm cache");
+
+    let fd = open_return_fd(&resolver, &base, "NewFile.txt", ResolverIntent::CreateNew)
+        .expect("create file");
+    unsafe {
+        libc::close(fd);
+    }
+
+    let resolved =
+        open_return_path(&resolver, &base, "newfile.TXT", ResolverIntent::Read).unwrap();
+    assert_path_ends_with(&resolved, Path::new("NewFile.txt"));
+}
+
+#[test]
+fn cache_invalidation_after_mkdirs() {
+    std::env::set_var("WCFSS_TTL_FAST_MS", "10_000");
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("invalidate_mkdirs");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    fs::write(temp.path.join("Seed.txt"), b"seed").expect("write seed file");
+    let _ = open_return_path(&resolver, &base, "SEED.txt", ResolverIntent::Read)
+        .expect("warm cache");
+
+    let status = execute_mkdirs(&resolver, &base, "NewDir/SubDir");
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let resolved =
+        open_return_path(&resolver, &base, "newdir", ResolverIntent::StatExists).unwrap();
+    assert_path_ends_with(&resolved, Path::new("NewDir"));
+}
+
+#[test]
+fn cache_invalidation_after_rename() {
+    std::env::set_var("WCFSS_TTL_FAST_MS", "10_000");
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("invalidate_rename");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    fs::write(temp.path.join("OldName.txt"), b"data").expect("write file");
+    let _ = open_return_path(&resolver, &base, "OLDNAME.TXT", ResolverIntent::Read)
+        .expect("warm cache");
+
+    let status = execute_rename(&resolver, &base, "OldName.txt", "NewName.txt");
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let resolved =
+        open_return_path(&resolver, &base, "newname.TXT", ResolverIntent::Read).unwrap();
+    assert_path_ends_with(&resolved, Path::new("NewName.txt"));
+}
+
+#[test]
+fn cache_invalidation_after_unlink_collision() {
+    std::env::set_var("WCFSS_TTL_FAST_MS", "10_000");
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("invalidate_unlink");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    let first = temp.path.join("Gone.txt");
+    fs::write(&first, b"one").expect("create Gone.txt");
+    let second = temp.path.join("gone.TXT");
+    match fs::OpenOptions::new().create_new(true).write(true).open(&second) {
+        Ok(mut f) => {
+            f.write_all(b"two").unwrap();
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("unlink invalidate test skipped: case-sensitive entries not supported");
+            return;
+        }
+        Err(err) => panic!("unexpected error creating second entry: {err}"),
+    }
+
+    let status = open_return_path(&resolver, &base, "GONE.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::Collision);
+
+    let status = execute_unlink(&resolver, &base, "Gone.txt");
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let resolved =
+        open_return_path(&resolver, &base, "GONE.txt", ResolverIntent::Read).unwrap();
+    assert_path_ends_with(&resolved, Path::new("gone.TXT"));
 }

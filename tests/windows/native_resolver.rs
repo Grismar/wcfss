@@ -138,6 +138,57 @@ fn open_return_fd(
     Ok(fd)
 }
 
+fn execute_mkdirs(
+    resolver: &TestResolver,
+    base_dir: &str,
+    input_path: &str,
+) -> ResolverStatus {
+    let (_base_buf, base_view) = make_view(base_dir);
+    let (_input_buf, input_view) = make_view(input_path);
+    resolver_execute_mkdirs(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    )
+}
+
+fn execute_rename(
+    resolver: &TestResolver,
+    base_dir: &str,
+    from_path: &str,
+    to_path: &str,
+) -> ResolverStatus {
+    let (_base_buf, base_view) = make_view(base_dir);
+    let (_from_buf, from_view) = make_view(from_path);
+    let (_to_buf, to_view) = make_view(to_path);
+    resolver_execute_rename(
+        resolver.handle,
+        &base_view,
+        &from_view,
+        &to_view,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    )
+}
+
+fn execute_unlink(
+    resolver: &TestResolver,
+    base_dir: &str,
+    input_path: &str,
+) -> ResolverStatus {
+    let (_base_buf, base_view) = make_view(base_dir);
+    let (_input_buf, input_view) = make_view(input_path);
+    resolver_execute_unlink(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    )
+}
+
 fn assert_path_ends_with(resolved: &str, tail: &Path) {
     let resolved_path = Path::new(resolved);
     assert!(
@@ -435,4 +486,80 @@ fn reserved_names_treated_as_missing() {
             .unwrap_or(ResolverStatus::Ok);
         assert_eq!(status, ResolverStatus::NotFound);
     }
+}
+
+#[test]
+fn cache_invalidation_after_create() {
+    let resolver = TestResolver::new();
+    let temp = TempDir::new("invalidate_create");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    fs::write(temp.path.join("Seed.txt"), b"seed").expect("write seed file");
+    let _ = open_return_path(&resolver, &base, "SEED.txt", ResolverIntent::Read)
+        .expect("warm cache");
+
+    let fd = open_return_fd(&resolver, &base, "NewFile.txt", ResolverIntent::CreateNew)
+        .expect("create file");
+    unsafe {
+        libc::close(fd);
+    }
+
+    let resolved =
+        open_return_path(&resolver, &base, "newfile.TXT", ResolverIntent::Read).unwrap();
+    assert_path_ends_with(&resolved, Path::new("NewFile.txt"));
+}
+
+#[test]
+fn cache_invalidation_after_mkdirs() {
+    let resolver = TestResolver::new();
+    let temp = TempDir::new("invalidate_mkdirs");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    fs::write(temp.path.join("Seed.txt"), b"seed").expect("write seed file");
+    let _ = open_return_path(&resolver, &base, "SEED.txt", ResolverIntent::Read)
+        .expect("warm cache");
+
+    let status = execute_mkdirs(&resolver, &base, "NewDir/SubDir");
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let resolved =
+        open_return_path(&resolver, &base, "newdir", ResolverIntent::StatExists).unwrap();
+    assert_path_ends_with(&resolved, Path::new("NewDir"));
+}
+
+#[test]
+fn cache_invalidation_after_rename() {
+    let resolver = TestResolver::new();
+    let temp = TempDir::new("invalidate_rename");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    fs::write(temp.path.join("OldName.txt"), b"data").expect("write file");
+    let _ = open_return_path(&resolver, &base, "OLDNAME.TXT", ResolverIntent::Read)
+        .expect("warm cache");
+
+    let status = execute_rename(&resolver, &base, "OldName.txt", "NewName.txt");
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let resolved =
+        open_return_path(&resolver, &base, "newname.TXT", ResolverIntent::Read).unwrap();
+    assert_path_ends_with(&resolved, Path::new("NewName.txt"));
+}
+
+#[test]
+fn cache_invalidation_after_unlink() {
+    let resolver = TestResolver::new();
+    let temp = TempDir::new("invalidate_unlink");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    fs::write(temp.path.join("Gone.txt"), b"one").expect("write file");
+    let _ = open_return_path(&resolver, &base, "GONE.txt", ResolverIntent::Read)
+        .expect("warm cache");
+
+    let status = execute_unlink(&resolver, &base, "Gone.txt");
+    assert_eq!(status, ResolverStatus::Ok);
+
+    let status = open_return_path(&resolver, &base, "GONE.txt", ResolverIntent::Read)
+        .err()
+        .unwrap_or(ResolverStatus::Ok);
+    assert_eq!(status, ResolverStatus::NotFound);
 }
