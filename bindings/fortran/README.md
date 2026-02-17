@@ -8,13 +8,17 @@ Files:
 ## Build / Link
 
 You need to link against the wcfss shared library produced by the Rust build.
-Example (Linux, gfortran):
+Example (Linux, Intel ifx):
 ```sh
-gfortran -c wcfss.f90
-gfortran -o my_app my_app.f90 wcfss.o -L/path/to/lib -lwcfss
+ifx -c wcfss.f90
+ifx -o my_app my_app.f90 wcfss.o -L/path/to/lib -lwcfss
 ```
 
-On Windows (MinGW), link against `wcfss.dll` import library as appropriate.
+On Windows (Intel oneAPI), link against the `wcfss.dll` import library
+(`wcfss.lib`) and ensure `wcfss.dll` is on `PATH` at runtime.
+
+On Linux, ensure the runtime linker can find the shared library
+(e.g. set `LD_LIBRARY_PATH` or use an rpath).
 
 ## Usage
 
@@ -49,3 +53,11 @@ If a wrapper returns allocated buffers (e.g., plans or resolved paths), use:
 - `wcfss_diag_destroy(diag)`
 
 These wrappers call `resolver_free_*` as required by the C ABI.
+
+## Notes on ifx Compatibility
+
+The module is standard Fortran 2003 with `ISO_C_BINDING`, so no code changes
+are required for ifx. The only implications are build/link details:
+- Use the ifx toolchain for both compilation and linking.
+- Make sure you link against the correct platform library name (`-lwcfss`
+  on Linux, `wcfss.lib` on Windows).
