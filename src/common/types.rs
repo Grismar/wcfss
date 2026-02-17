@@ -188,6 +188,7 @@ pub struct ResolverResolvedPath {
 }
 
 pub const RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY: u32 = 1 << 0;
+pub const RESOLVER_FLAG_ENABLE_WINDOWS_ABSOLUTE_PATHS: u32 = 1 << 1;
 pub const RESOLVER_PLAN_TARGET_EXISTS: u32 = 1 << 0;
 pub const RESOLVER_PLAN_TARGET_IS_DIR: u32 = 1 << 1;
 pub const RESOLVER_PLAN_WOULD_CREATE: u32 = 1 << 2;

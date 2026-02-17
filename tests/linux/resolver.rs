@@ -347,7 +347,7 @@ fn dirindex_ttl_refresh_detects_changes() {
 #[test]
 fn dirindex_generation_invalidation_clears_cache() {
     std::env::set_var("WCFSS_TTL_FAST_MS", "10_000");
-    let resolver = TestResolver::new(0);
+    let resolver = TestResolver::new(RESOLVER_FLAG_ENABLE_WINDOWS_ABSOLUTE_PATHS);
     let temp = TempDir::new("generation_invalidate");
     let base = temp.path.to_string_lossy().into_owned();
 

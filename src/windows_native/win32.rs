@@ -3,17 +3,19 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{
-    BOOL, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BAD_PATHNAME, ERROR_DIRECTORY,
-    ERROR_FILENAME_EXCED_RANGE, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
-    ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE,
+    BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BAD_PATHNAME,
+    ERROR_DIRECTORY, ERROR_FILENAME_EXCED_RANGE, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_NAME, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, DeleteFileW, FindClose, FindFirstFileW, FindNextFileW,
-    GetFileAttributesW, MoveFileExW, CREATE_ALWAYS, CREATE_NEW, FILE_APPEND_DATA,
-    FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
-    OPEN_ALWAYS, OPEN_EXISTING, WIN32_FIND_DATAW,
+    GetFileAttributesW, GetFileInformationByHandle, MoveFileExW, BY_HANDLE_FILE_INFORMATION,
+    CREATE_ALWAYS, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING, OPEN_ALWAYS,
+    OPEN_EXISTING, WIN32_FIND_DATAW,
 };
 
 use crate::common::types::ResolverStatus;
@@ -73,6 +75,41 @@ pub fn get_file_attributes(path: &Path) -> Result<u32, ResolverStatus> {
         }));
     }
     Ok(attrs)
+}
+
+pub fn get_file_id(path: &Path) -> Result<(u64, u64), ResolverStatus> {
+    let wide = os_str_to_wide(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(map_win32_error(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
+    }
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    let status = if ok == 0 {
+        Err(map_win32_error(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }))
+    } else {
+        let ino = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+        Ok((info.dwVolumeSerialNumber as u64, ino))
+    };
+    unsafe {
+        CloseHandle(handle);
+    }
+    status
 }
 
 pub fn find_match(dir: &Path, target: &OsStr) -> Result<MatchResult, ResolverStatus> {

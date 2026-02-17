@@ -84,6 +84,12 @@ struct MetricsCounters {
     plans_rejected_stale: AtomicU64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RootMappingKey {
+    Drive(char),
+    Unc { server: String, share: String },
+}
+
 fn map_io_error(err: &io::Error) -> ResolverStatus {
     use io::ErrorKind;
     if let Some(code) = err.raw_os_error() {
@@ -113,6 +119,10 @@ fn string_view_to_string(view: *const ResolverStringView) -> Result<String, Reso
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
         .map_err(|_| ResolverStatus::EncodingError)
+}
+
+fn base_dir_from_view(view: *const ResolverStringView) -> Result<String, ResolverStatus> {
+    string_view_to_string(view).map_err(|_| ResolverStatus::BaseDirInvalid)
 }
 
 fn build_dir_index(
@@ -214,6 +224,59 @@ fn normalize_input(input: &str) -> (String, bool) {
         }
     }
     (normalized, had_backslash)
+}
+
+fn normalize_root_mapping_key(input: &str) -> Result<RootMappingKey, ResolverStatus> {
+    let (normalized, _) = normalize_input(input);
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            if trimmed.len() == 2 {
+                let drive = (bytes[0] as char).to_ascii_uppercase();
+                return Ok(RootMappingKey::Drive(drive));
+            }
+            return Err(ResolverStatus::InvalidPath);
+        }
+    }
+
+    if normalized.starts_with("//") {
+        let mut parts = normalized[2..].split('/').filter(|p| !p.is_empty());
+        let server = parts.next().ok_or(ResolverStatus::InvalidPath)?;
+        let share = parts.next().ok_or(ResolverStatus::InvalidPath)?;
+        if parts.next().is_some() {
+            return Err(ResolverStatus::InvalidPath);
+        }
+        return Ok(RootMappingKey::Unc {
+            server: parser::key_simple_uppercase(server),
+            share: parser::key_simple_uppercase(share),
+        });
+    }
+
+    Err(ResolverStatus::InvalidPath)
+}
+
+fn precheck_escapes_root(normalized: &str, skip_components: usize) -> Result<(), ResolverStatus> {
+    let mut depth: isize = 0;
+    let mut skipped = 0usize;
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if skipped < skip_components {
+            skipped += 1;
+            continue;
+        }
+        if part == ".." {
+            if depth == 0 {
+                return Err(ResolverStatus::EscapesRoot);
+            }
+            depth -= 1;
+            continue;
+        }
+        depth += 1;
+    }
+    Ok(())
 }
 
 fn init_plan(plan: &mut ResolverPlan) {
@@ -454,34 +517,6 @@ fn validate_base_dir(base_dir: &str) -> Result<PathBuf, ResolverStatus> {
     Ok(path)
 }
 
-fn classify_root(normalized: &str) -> Result<Option<PathBuf>, ResolverStatus> {
-    let trimmed = normalized.trim_start_matches('/');
-    let leading = normalized.len() - trimmed.len();
-    if leading >= 2 {
-        let mut parts = trimmed.split('/').filter(|p| !p.is_empty());
-        if parts.next().is_some() && parts.next().is_some() {
-            trace("UNC-style path detected on Linux (unsupported).");
-            return Err(ResolverStatus::UnsupportedAbsolutePath);
-        }
-    }
-
-    if normalized.len() >= 2 {
-        let bytes = normalized.as_bytes();
-        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-            if normalized.len() == 2 || !normalized.as_bytes()[2].eq(&b'/') {
-                return Err(ResolverStatus::InvalidPath);
-            }
-            trace("Drive-letter path detected on Linux (unsupported).");
-            return Err(ResolverStatus::UnsupportedAbsolutePath);
-        }
-    }
-
-    if normalized.starts_with('/') {
-        return Ok(Some(PathBuf::from("/")));
-    }
-    Ok(None)
-}
-
 #[derive(Debug)]
 struct ResolvedInfo {
     path: PathBuf,
@@ -578,7 +613,7 @@ fn select_component(
 
 fn resolve_path(
     resolver: &LinuxResolver,
-    base_dir: &Path,
+    base_dir: &str,
     input_path: &str,
     intent: ResolverIntent,
     mut plan_trace: Option<&mut PlanTrace>,
@@ -601,7 +636,7 @@ fn resolve_path(
         }
     }
 
-    let root = match classify_root(&normalized) {
+    let (root, skip_components) = match resolver.classify_root(&normalized) {
         Ok(value) => value,
         Err(status) => {
             if let Some(diag) = diag.as_deref_mut() {
@@ -624,12 +659,29 @@ fn resolve_path(
             return Err(status);
         }
     };
-    let mut current = root.unwrap_or_else(|| base_dir.to_path_buf());
+    if let Err(status) = precheck_escapes_root(&normalized, skip_components) {
+        if let Some(diag) = diag.as_deref_mut() {
+            diag.push(
+                ResolverDiagCode::EscapesRoot,
+                ResolverDiagSeverity::Error,
+                input_path.to_string(),
+                "path escapes root".to_string(),
+            );
+        }
+        return Err(status);
+    }
+    let base_dir_path = validate_base_dir(base_dir)?;
+    let mut current = root.unwrap_or_else(|| base_dir_path.to_path_buf());
     let mut stack: Vec<(PathBuf, bool)> = vec![(current.clone(), false)];
 
     let mut components: Vec<&str> = Vec::new();
+    let mut skipped = 0usize;
     for part in normalized.split('/') {
         if part.is_empty() || part == "." {
+            continue;
+        }
+        if skipped < skip_components {
+            skipped += 1;
             continue;
         }
         if part.as_bytes().len() > MAX_COMPONENT_BYTES {
@@ -852,7 +904,7 @@ fn resolve_path(
 
 fn plan_mkdirs(
     resolver: &LinuxResolver,
-    base_dir: &Path,
+    base_dir: &str,
     input_path: &str,
     mut plan_trace: Option<&mut PlanTrace>,
     mut diag: Option<&mut DiagCollector>,
@@ -874,7 +926,7 @@ fn plan_mkdirs(
         }
     }
 
-    let root = match classify_root(&normalized) {
+    let (root, skip_components) = match resolver.classify_root(&normalized) {
         Ok(value) => value,
         Err(status) => {
             if let Some(diag) = diag.as_deref_mut() {
@@ -897,12 +949,29 @@ fn plan_mkdirs(
             return Err(status);
         }
     };
-    let mut current = root.unwrap_or_else(|| base_dir.to_path_buf());
+    if let Err(status) = precheck_escapes_root(&normalized, skip_components) {
+        if let Some(diag) = diag.as_deref_mut() {
+            diag.push(
+                ResolverDiagCode::EscapesRoot,
+                ResolverDiagSeverity::Error,
+                input_path.to_string(),
+                "path escapes root".to_string(),
+            );
+        }
+        return Err(status);
+    }
+    let base_dir_path = validate_base_dir(base_dir)?;
+    let mut current = root.unwrap_or_else(|| base_dir_path.to_path_buf());
     let mut stack: Vec<(PathBuf, bool)> = vec![(current.clone(), false)];
 
     let mut components: Vec<&str> = Vec::new();
+    let mut skipped = 0usize;
     for part in normalized.split('/') {
         if part.is_empty() || part == "." {
+            continue;
+        }
+        if skipped < skip_components {
+            skipped += 1;
             continue;
         }
         if part.as_bytes().len() > MAX_COMPONENT_BYTES {
@@ -1095,23 +1164,29 @@ pub struct LinuxResolver {
     mutation_lock: Mutex<()>,
     dir_generations: RwLock<HashMap<(u64, u64), u64>>,
     metrics: MetricsCounters,
+    root_mapping_enabled: bool,
+    root_mapping: RwLock<HashMap<RootMappingKey, PathBuf>>,
 }
 
 impl LinuxResolver {
     pub fn new(config: *const ResolverConfig) -> Self {
         let mut strict_utf8 = false;
         let mut config_ttl_ms = None;
+        let mut root_mapping_enabled = false;
         if let Some(cfg) = unsafe { config.as_ref() } {
             strict_utf8 = cfg.flags & RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY != 0;
+            root_mapping_enabled =
+                cfg.flags & RESOLVER_FLAG_ENABLE_WINDOWS_ABSOLUTE_PATHS != 0;
             if cfg.size as usize >= std::mem::size_of::<ResolverConfig>() {
                 config_ttl_ms = Some(cfg.ttl_fast_ms);
             }
         }
         let encoding_policy_generation = if strict_utf8 { 1 } else { 0 };
+        let absolute_path_support_generation = if root_mapping_enabled { 1 } else { 0 };
         let generations = ResolverGenerations {
             unicode_version_generation: 1,
             root_mapping_generation: 0,
-            absolute_path_support_generation: 0,
+            absolute_path_support_generation,
             encoding_policy_generation,
             symlink_policy_generation: 0,
         };
@@ -1128,6 +1203,8 @@ impl LinuxResolver {
             mutation_lock: Mutex::new(()),
             dir_generations: RwLock::new(HashMap::new()),
             metrics: MetricsCounters::default(),
+            root_mapping_enabled,
+            root_mapping: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1144,6 +1221,57 @@ impl LinuxResolver {
             cache.clear();
             self.cache_generation.store(current, Ordering::SeqCst);
         }
+    }
+
+    fn classify_root(
+        &self,
+        normalized: &str,
+    ) -> Result<(Option<PathBuf>, usize), ResolverStatus> {
+        let trimmed = normalized.trim_start_matches('/');
+        let leading = normalized.len() - trimmed.len();
+        if leading >= 2 {
+            if !self.root_mapping_enabled {
+                trace("UNC-style path detected on Linux (unsupported).");
+                return Err(ResolverStatus::UnsupportedAbsolutePath);
+            }
+            let mut parts = trimmed.split('/').filter(|p| !p.is_empty());
+            let server = parts.next().ok_or(ResolverStatus::InvalidPath)?;
+            let share = parts.next().ok_or(ResolverStatus::InvalidPath)?;
+            let key = RootMappingKey::Unc {
+                server: parser::key_simple_uppercase(server),
+                share: parser::key_simple_uppercase(share),
+            };
+            let mapping = self.root_mapping.read().expect("root_mapping lock poisoned");
+            if let Some(root) = mapping.get(&key) {
+                return Ok((Some(root.clone()), 2));
+            }
+            return Err(ResolverStatus::UnmappedRoot);
+        }
+
+        if normalized.len() >= 2 {
+            let bytes = normalized.as_bytes();
+            if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                if normalized.len() == 2 || !normalized.as_bytes()[2].eq(&b'/') {
+                    return Err(ResolverStatus::InvalidPath);
+                }
+                if !self.root_mapping_enabled {
+                    trace("Drive-letter path detected on Linux (unsupported).");
+                    return Err(ResolverStatus::UnsupportedAbsolutePath);
+                }
+                let drive = (bytes[0] as char).to_ascii_uppercase();
+                let key = RootMappingKey::Drive(drive);
+                let mapping = self.root_mapping.read().expect("root_mapping lock poisoned");
+                if let Some(root) = mapping.get(&key) {
+                    return Ok((Some(root.clone()), 1));
+                }
+                return Err(ResolverStatus::UnmappedRoot);
+            }
+        }
+
+        if normalized.starts_with('/') {
+            return Ok((Some(PathBuf::from("/")), 0));
+        }
+        Ok((None, 0))
     }
 
     fn get_dir_index(
@@ -1302,9 +1430,45 @@ impl Resolver for LinuxResolver {
         mapping: *const ResolverRootMapping,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        let mapping = unsafe { mapping.as_ref() };
-        if mapping.is_none() {
+        if !self.root_mapping_enabled {
+            return ResolverStatus::UnsupportedAbsolutePath;
+        }
+        let mapping = match unsafe { mapping.as_ref() } {
+            Some(value) => value,
+            None => return ResolverStatus::InvalidPath,
+        };
+        if mapping.entries.is_null() && mapping.len != 0 {
             return ResolverStatus::InvalidPath;
+        }
+        let entries = if mapping.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(mapping.entries, mapping.len) }
+        };
+
+        let mut table: HashMap<RootMappingKey, PathBuf> = HashMap::new();
+        for entry in entries {
+            let key_str = match string_view_to_string(&entry.key as *const ResolverStringView) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+            let value_str = match string_view_to_string(&entry.value as *const ResolverStringView) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+            let key = match normalize_root_mapping_key(&key_str) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+            if !value_str.starts_with('/') {
+                return ResolverStatus::InvalidPath;
+            }
+            table.insert(key, PathBuf::from(value_str));
+        }
+
+        {
+            let mut mapping_guard = self.root_mapping.write().expect("root_mapping lock poisoned");
+            *mapping_guard = table;
         }
         {
             let mut generations = self.generations.write().expect("generations lock poisoned");
@@ -1323,11 +1487,11 @@ impl Resolver for LinuxResolver {
         out_plan: *mut ResolverPlan,
         out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        let base_dir = match string_view_to_string(base_dir) {
+        let input_path = match string_view_to_string(input_path) {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let input_path = match string_view_to_string(input_path) {
+        let base_dir = match base_dir_from_view(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -1337,18 +1501,13 @@ impl Resolver for LinuxResolver {
             base_dir, input_path, intent
         ));
 
-        let base_dir_path = match validate_base_dir(&base_dir) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-
         let plan_out = unsafe { out_plan.as_mut() };
         let mut diag = DiagCollector::default();
 
         let mut plan_trace = PlanTrace::default();
         match resolve_path(
             self,
-            &base_dir_path,
+            &base_dir,
             &input_path,
             intent,
             Some(&mut plan_trace),
@@ -1452,15 +1611,11 @@ impl Resolver for LinuxResolver {
         out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         self.begin_execute();
-        let base_dir = match string_view_to_string(base_dir) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
         let input_path = match string_view_to_string(input_path) {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let base_dir_path = match validate_base_dir(&base_dir) {
+        let base_dir = match base_dir_from_view(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -1471,7 +1626,7 @@ impl Resolver for LinuxResolver {
         }
 
         let mut diag = DiagCollector::default();
-        let plan = match plan_mkdirs(self, &base_dir_path, &input_path, None, Some(&mut diag)) {
+        let plan = match plan_mkdirs(self, &base_dir, &input_path, None, Some(&mut diag)) {
             Ok(value) => value,
             Err(status) => {
                 write_diag_entries(out_diag, &diag);
@@ -1556,10 +1711,6 @@ impl Resolver for LinuxResolver {
         out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         self.begin_execute();
-        let base_dir = match string_view_to_string(base_dir) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
         let from_path = match string_view_to_string(from_path) {
             Ok(value) => value,
             Err(status) => return status,
@@ -1568,7 +1719,7 @@ impl Resolver for LinuxResolver {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let base_dir_path = match validate_base_dir(&base_dir) {
+        let base_dir = match base_dir_from_view(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -1581,7 +1732,7 @@ impl Resolver for LinuxResolver {
         let mut diag = DiagCollector::default();
         let source = match resolve_path(
             self,
-            &base_dir_path,
+            &base_dir,
             &from_path,
             ResolverIntent::Read,
             None,
@@ -1597,7 +1748,7 @@ impl Resolver for LinuxResolver {
         let destination =
             match resolve_path(
                 self,
-                &base_dir_path,
+                &base_dir,
                 &to_path,
                 ResolverIntent::WriteTruncate,
                 None,
@@ -1657,15 +1808,11 @@ impl Resolver for LinuxResolver {
         out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         self.begin_execute();
-        let base_dir = match string_view_to_string(base_dir) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
         let input_path = match string_view_to_string(input_path) {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let base_dir_path = match validate_base_dir(&base_dir) {
+        let base_dir = match base_dir_from_view(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -1678,7 +1825,7 @@ impl Resolver for LinuxResolver {
         let mut diag = DiagCollector::default();
         let info = match resolve_path(
             self,
-            &base_dir_path,
+            &base_dir,
             &input_path,
             ResolverIntent::Read,
             None,
@@ -1730,15 +1877,11 @@ impl Resolver for LinuxResolver {
         out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
         self.begin_execute();
-        let base_dir = match string_view_to_string(base_dir) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
         let input_path = match string_view_to_string(input_path) {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let base_dir_path = match validate_base_dir(&base_dir) {
+        let base_dir = match base_dir_from_view(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -1746,7 +1889,7 @@ impl Resolver for LinuxResolver {
         let mut diag = DiagCollector::default();
         let info = match resolve_path(
             self,
-            &base_dir_path,
+            &base_dir,
             &input_path,
             intent,
             None,
@@ -1799,15 +1942,11 @@ impl Resolver for LinuxResolver {
             return ResolverStatus::InvalidPath;
         }
         self.begin_execute();
-        let base_dir = match string_view_to_string(base_dir) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
         let input_path = match string_view_to_string(input_path) {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let base_dir_path = match validate_base_dir(&base_dir) {
+        let base_dir = match base_dir_from_view(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -1815,7 +1954,7 @@ impl Resolver for LinuxResolver {
         let mut diag = DiagCollector::default();
         let info = match resolve_path(
             self,
-            &base_dir_path,
+            &base_dir,
             &input_path,
             intent,
             None,
@@ -1890,8 +2029,7 @@ impl Resolver for LinuxResolver {
         // operations from interleaving generation checks.
         let _guard = self.mutation_lock.lock().expect("mutation_lock poisoned");
 
-        // TODO(sync): once execute_from_plan is implemented, validate full plan token
-        // generations and per-directory DirGeneration as required by §12.5.
+        // Validate plan token generations and per-directory DirGeneration as required by §12.5.
         let expected_token_size = std::mem::size_of::<ResolverPlanToken>() as u32;
         let expected_plan_size = std::mem::size_of::<ResolverPlan>() as u32;
         if plan.size < expected_plan_size || plan.plan_token.size < expected_token_size {
@@ -2112,8 +2250,26 @@ impl Resolver for LinuxResolver {
         }
     }
 
-    fn get_metrics(&self, _out_metrics: *mut ResolverMetrics) -> ResolverStatus {
-        // TODO(linux): populate metrics counters.
+    fn get_metrics(&self, out_metrics: *mut ResolverMetrics) -> ResolverStatus {
+        let out_metrics = unsafe { out_metrics.as_mut() };
+        let out_metrics = match out_metrics {
+            Some(out) => out,
+            None => return ResolverStatus::InvalidPath,
+        };
+        out_metrics.size = std::mem::size_of::<ResolverMetrics>() as u32;
+        out_metrics.dirindex_cache_hits =
+            self.metrics.dirindex_cache_hits.load(Ordering::SeqCst);
+        out_metrics.dirindex_cache_misses =
+            self.metrics.dirindex_cache_misses.load(Ordering::SeqCst);
+        out_metrics.dirindex_rebuilds = self.metrics.dirindex_rebuilds.load(Ordering::SeqCst);
+        out_metrics.stamp_validations = self.metrics.stamp_validations.load(Ordering::SeqCst);
+        out_metrics.collisions = self.metrics.collisions.load(Ordering::SeqCst);
+        out_metrics.invalid_utf8_entries =
+            self.metrics.invalid_utf8_entries.load(Ordering::SeqCst);
+        out_metrics.encoding_errors = self.metrics.encoding_errors.load(Ordering::SeqCst);
+        out_metrics.plans_rejected_stale =
+            self.metrics.plans_rejected_stale.load(Ordering::SeqCst);
+        out_metrics.reserved = [0; 4];
         ResolverStatus::Ok
     }
 }

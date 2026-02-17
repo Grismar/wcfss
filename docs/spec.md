@@ -66,10 +66,19 @@ Legacy configs may include:
 
 Policy:
 - On Linux, drive/UNC support is **disabled by default**.
+- Enable drive/UNC support via resolver configuration flag `RESOLVER_FLAG_ENABLE_WINDOWS_ABSOLUTE_PATHS`.
 - If enabled, the resolver parses to an internal `root_id`:
   - `drive:X`
   - `unc:server/share`
 - The resolver translates `root_id` to an OS path using an application-supplied **root mapping table**.
+
+Root mapping keys:
+- Drive roots accept `X:`, `X:\`, or `X:/` (drive letter case-insensitive).
+- UNC roots accept `\\server\share` or `//server/share`.
+- Matching MUST be case-insensitive using `K(s)` on the drive letter and on UNC server/share names.
+
+Root mapping values:
+- MUST be absolute OS paths (Linux: start with `/`) and valid UTF-8.
 
 If disabled or no mapping exists:
 - Intents fail with `UNSUPPORTED_ABSOLUTE_PATH` (disabled) or `UNMAPPED_ROOT` (enabled but not mapped).
@@ -497,7 +506,8 @@ Minimum:
 - `resolver_execute_unlink(handle, base_dir, input_path, out_result, out_diag) -> status`
 - `resolver_execute_open_return_path(handle, base_dir, input_path, intent, out_resolved_path, out_diag) -> status`
 - `resolver_get_metrics(handle, out_metrics) -> status`
- - `resolver_free_string(value) -> void` (required if `resolver_execute_open_return_path` allocates)
+- `resolver_free_string(value) -> void` (required if `resolver_execute_open_return_path` allocates)
+- `resolver_free_buffer(value) -> void` (required if `resolver_plan` or diagnostics allocate buffers)
 
 Optional:
 - `resolver_execute_open_return_fd(handle, base_dir, input_path, intent, out_fd, out_diag) -> status`
@@ -526,6 +536,13 @@ If `resolver_execute_open_return_path` returns a non-empty path via `ResolverRes
 - The caller MUST release the buffer with `resolver_free_string`.
 - The buffer remains valid across subsequent resolver calls and after `resolver_destroy` (it is standalone heap memory).
 - `resolver_free_string` MUST be safe to call with `{ ptr = NULL, len = 0 }`.
+
+If `resolver_plan` returns a `ResolverPlanToken` with non-empty `dir_generations` or `touched_dir_stamps`, the implementation MAY allocate those buffers. In that case:
+- The caller MUST release each buffer with `resolver_free_buffer` before reusing or discarding the plan.
+- `resolver_free_buffer` MUST be safe to call with `{ ptr = NULL, len = 0 }`.
+
+If diagnostics return a non-empty `ResolverDiag.entries` buffer, the implementation MAY allocate it. In that case:
+- The caller MUST release the buffer with `resolver_free_buffer`.
 
 Bindings:
 - Fortran: `ISO_C_BINDING` wrappers.
