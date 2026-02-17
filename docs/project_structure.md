@@ -7,12 +7,10 @@ wcfss/
 │       └── 15.1/
 │           └── UnicodeData.txt
 ├── src/
-│   ├── lib.rs              # Public C ABI
-│   ├── common/             # Shared types and utilities
+│   ├── lib.rs              # Public C ABI + platform dispatch
+│   ├── common/             # Shared types
 │   │   ├── mod.rs
-│   │   ├── types.rs        # Status codes, config structs
-│   │   ├── unicode.rs      # Unicode tables (if shared)
-│   │   └── diagnostics.rs
+│   │   └── types.rs        # Status codes, config structs, FFI structs
 │   ├── windows_native/     # Windows implementation
 │   │   ├── mod.rs
 │   │   ├── resolver.rs
@@ -21,13 +19,13 @@ wcfss/
 │       ├── mod.rs
 │       ├── resolver.rs
 │       ├── parser.rs
-│       ├── dirindex.rs
-│       └── cache.rs
+│       └── dirindex.rs
 ├── tests/
-│   ├── common/             # Shared test cases
 │   ├── windows/            # Windows-specific tests
-│   └── linux/              # Linux-specific tests
-└── bindings/
-    ├── fortran/
-    ├── python/
-    └── rust/
+│   ├── linux/              # Linux-specific tests
+│   ├── windows.rs          # Test harness for Windows targets
+│   └── linux.rs            # Test harness for Linux targets
+└── docs/
+    ├── spec.md
+    ├── environment.md
+    └── project_structure.md
