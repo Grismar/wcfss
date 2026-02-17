@@ -64,6 +64,14 @@ pub struct ResolverStringView {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct ResolverPlanToken {
+    pub size: u32,
+    pub op_generation: u64,
+    pub reserved: [u64; 6],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct ResolverPlan {
     pub size: u32,
     pub status: ResolverStatus,
@@ -71,6 +79,7 @@ pub struct ResolverPlan {
     pub flags: u32,
     pub resolved_parent: ResolverStringView,
     pub resolved_leaf: ResolverStringView,
+    pub plan_token: ResolverPlanToken,
     // TODO(spec): add plan token fields (generations, dir generations, stamps).
     pub reserved: [u64; 6],
 }

@@ -2,6 +2,8 @@ use std::ffi::c_char;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wcfss::*;
@@ -14,6 +16,9 @@ use std::os::unix::ffi::OsStrExt;
 struct TestResolver {
     handle: *mut ResolverHandle,
 }
+
+unsafe impl Send for TestResolver {}
+unsafe impl Sync for TestResolver {}
 
 impl TestResolver {
     fn new(flags: u32) -> Self {
@@ -502,4 +507,105 @@ fn cache_invalidation_after_unlink_collision() {
     let resolved =
         open_return_path(&resolver, &base, "GONE.txt", ResolverIntent::Read).unwrap();
     assert_path_ends_with(&resolved, Path::new("gone.TXT"));
+}
+
+#[test]
+fn plan_token_stale_after_execute() {
+    let resolver = TestResolver::new(0);
+    let temp = TempDir::new("plan_token_stale");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    fs::write(temp.path.join("Plan.txt"), b"data").expect("write file");
+    let (_base_buf, base_view) = make_view(&base);
+    let (_input_buf, input_view) = make_view("Plan.txt");
+    let mut plan = ResolverPlan {
+        size: std::mem::size_of::<ResolverPlan>() as u32,
+        status: ResolverStatus::Ok,
+        would_error: ResolverStatus::Ok,
+        flags: 0,
+        resolved_parent: ResolverStringView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        resolved_leaf: ResolverStringView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        plan_token: ResolverPlanToken {
+            size: std::mem::size_of::<ResolverPlanToken>() as u32,
+            op_generation: 0,
+            reserved: [0; 6],
+        },
+        reserved: [0; 6],
+    };
+    let status = resolver_plan(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        ResolverIntent::StatExists,
+        &mut plan,
+        std::ptr::null_mut(),
+    );
+    assert_eq!(status, ResolverStatus::Ok);
+
+    // Any execute bumps op_generation, which should make the plan stale.
+    let _ = open_return_path(&resolver, &base, "Plan.txt", ResolverIntent::Read)
+        .expect("execute to bump op_generation");
+
+    let status = resolver_execute_from_plan(
+        resolver.handle,
+        &plan,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    assert_eq!(status, ResolverStatus::StalePlan);
+    resolver_free_string(plan.resolved_parent);
+    resolver_free_string(plan.resolved_leaf);
+}
+
+#[test]
+fn stress_concurrent_reads_and_writes() {
+    let resolver = Arc::new(TestResolver::new(0));
+    let temp = TempDir::new("stress_threads");
+    let base = temp.path.to_string_lossy().into_owned();
+
+    fs::write(temp.path.join("File.txt"), b"data").expect("write file");
+
+    let mut threads = Vec::new();
+    for _ in 0..4 {
+        let resolver = Arc::clone(&resolver);
+        let base = base.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..100 {
+                let _ = open_return_path(&resolver, &base, "file.TXT", ResolverIntent::Read);
+            }
+        }));
+    }
+
+    let writer_resolver = Arc::clone(&resolver);
+    let writer_base = base.clone();
+    threads.push(thread::spawn(move || {
+        for idx in 0..50 {
+            let name = format!("Temp_{idx}.txt");
+            let fd = open_return_fd(
+                &writer_resolver,
+                &writer_base,
+                &name,
+                ResolverIntent::CreateNew,
+            );
+            if let Ok(fd) = fd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+            let _ = execute_unlink(&writer_resolver, &writer_base, &name);
+        }
+    }));
+
+    for handle in threads {
+        handle.join().expect("thread join");
+    }
+
+    let resolved = open_return_path(&resolver, &base, "FILE.txt", ResolverIntent::Read).unwrap();
+    assert_path_ends_with(&resolved, Path::new("File.txt"));
 }

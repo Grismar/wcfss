@@ -193,6 +193,11 @@ fn init_plan(plan: &mut ResolverPlan) {
         ptr: std::ptr::null(),
         len: 0,
     };
+    plan.plan_token = ResolverPlanToken {
+        size: std::mem::size_of::<ResolverPlanToken>() as u32,
+        op_generation: 0,
+        reserved: [0; 6],
+    };
     plan.reserved = [0; 6];
 }
 
@@ -340,6 +345,7 @@ impl Resolver for WindowsResolver {
                     plan_out.flags = flags;
                     plan_out.status = ResolverStatus::Ok;
                     plan_out.would_error = ResolverStatus::Ok;
+                    plan_out.plan_token.op_generation = 0;
                     if let Err(status) = set_plan_paths(plan_out, &path) {
                         plan_out.status = status;
                         plan_out.would_error = status;
@@ -353,6 +359,7 @@ impl Resolver for WindowsResolver {
                     init_plan(plan_out);
                     plan_out.status = status;
                     plan_out.would_error = status;
+                    plan_out.plan_token.op_generation = 0;
                 }
                 status
             }

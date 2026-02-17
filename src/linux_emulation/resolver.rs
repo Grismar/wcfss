@@ -1,15 +1,16 @@
 use crate::common::types::*;
-use crate::linux_emulation::cache::DirIndexCache;
+use crate::linux_emulation::cache::{evict_if_needed, DirCache};
 use crate::linux_emulation::dirindex::{DirIndex, DirStamp, EntrySet};
 use crate::linux_emulation::parser;
 use crate::resolver::Resolver;
 
 use core::ffi::c_char;
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use std::os::unix::ffi::OsStrExt;
@@ -153,6 +154,11 @@ fn init_plan(plan: &mut ResolverPlan) {
     plan.resolved_leaf = ResolverStringView {
         ptr: std::ptr::null(),
         len: 0,
+    };
+    plan.plan_token = ResolverPlanToken {
+        size: std::mem::size_of::<ResolverPlanToken>() as u32,
+        op_generation: 0,
+        reserved: [0; 6],
     };
     plan.reserved = [0; 6];
 }
@@ -685,16 +691,13 @@ fn plan_mkdirs(
 pub struct LinuxResolver {
     strict_utf8: bool,
     ttl_fast: Duration,
-    cache: RefCell<DirIndexCache>,
-    generations: Cell<ResolverGenerations>,
-    cache_generation: Cell<u64>,
-    op_generation: Cell<u64>,
+    dir_cache: RwLock<DirCache>,
+    cache_max_entries: usize,
+    generations: RwLock<ResolverGenerations>,
+    cache_generation: AtomicU64,
+    op_generation: AtomicU64,
+    mutation_lock: Mutex<()>,
 }
-
-// Safety: LinuxResolver uses interior mutability and is not synchronized.
-// The caller must not share a single instance across threads until locks are added.
-unsafe impl Send for LinuxResolver {}
-unsafe impl Sync for LinuxResolver {}
 
 impl LinuxResolver {
     pub fn new(config: *const ResolverConfig) -> Self {
@@ -716,71 +719,91 @@ impl LinuxResolver {
         Self {
             strict_utf8,
             ttl_fast,
-            cache: RefCell::new(DirIndexCache::new(DEFAULT_CACHE_MAX_ENTRIES)),
-            generations: Cell::new(generations),
-            cache_generation: Cell::new(cache_generation),
-            op_generation: Cell::new(0),
+            dir_cache: RwLock::new(DirCache::new()),
+            cache_max_entries: DEFAULT_CACHE_MAX_ENTRIES,
+            generations: RwLock::new(generations),
+            cache_generation: AtomicU64::new(cache_generation),
+            op_generation: AtomicU64::new(0),
+            mutation_lock: Mutex::new(()),
         }
     }
 
     fn current_dir_index_generation(&self) -> u64 {
-        combine_generations(self.generations.get())
+        let generations = self.generations.read().expect("generations lock poisoned");
+        combine_generations(*generations)
     }
 
     fn invalidate_cache_if_needed(&self) {
         let current = self.current_dir_index_generation();
-        if self.cache_generation.get() != current {
+        if self.cache_generation.load(Ordering::Acquire) != current {
             trace("DirIndex generation changed; clearing cache.");
-            self.cache.borrow_mut().clear();
-            self.cache_generation.set(current);
+            let mut cache = self.dir_cache.write().expect("dir_cache lock poisoned");
+            cache.clear();
+            self.cache_generation.store(current, Ordering::Release);
         }
     }
 
     fn get_dir_index(&self, dir: &Path) -> Result<DirIndex, ResolverStatus> {
+        // Locking strategy:
+        // - Never hold dir_cache locks during OS calls (metadata/read_dir).
+        // - Use a read lock for cache lookups.
+        // - Use a write lock only for in-memory updates/insertions/evictions.
         self.invalidate_cache_if_needed();
         let meta = fs::metadata(dir).map_err(|err| map_io_error(&err))?;
         let dir_id = (meta.dev(), meta.ino());
         let stamp = DirStamp::from_meta(&meta);
         let now = Instant::now();
 
-        {
-            let mut cache = self.cache.borrow_mut();
-            if let Some(entry) = cache.get_mut(&dir_id) {
-                let age = now.duration_since(entry.built_at);
-                if age < self.ttl_fast {
-                    trace(&format!(
-                        "DirIndex cache hit (ttl_fast, age {:?}).",
-                        age
-                    ));
-                    return Ok(entry.clone());
-                }
-                if entry.stamp.matches(&stamp) {
-                    trace("DirIndex cache hit (stamp match); refreshing built_at.");
-                    entry.built_at = now;
-                    return Ok(entry.clone());
-                }
-                trace("DirIndex cache stale; rebuilding.");
-            } else {
-                trace("DirIndex cache miss; building.");
+        let cached = {
+            let cache = self.dir_cache.read().expect("dir_cache lock poisoned");
+            cache.get(&dir_id).cloned()
+        };
+
+        if let Some(entry) = cached {
+            let age = now.duration_since(entry.built_at);
+            if age < self.ttl_fast {
+                trace(&format!(
+                    "DirIndex cache hit (ttl_fast, age {:?}).",
+                    age
+                ));
+                return Ok(entry);
             }
+            if entry.stamp.matches(&stamp) {
+                trace("DirIndex cache hit (stamp match); refreshing built_at.");
+                let mut cache = self.dir_cache.write().expect("dir_cache lock poisoned");
+                if let Some(existing) = cache.get_mut(&dir_id) {
+                    if existing.stamp.matches(&stamp) {
+                        existing.built_at = now;
+                        return Ok(existing.clone());
+                    }
+                }
+            }
+            trace("DirIndex cache stale; rebuilding.");
+        } else {
+            trace("DirIndex cache miss; building.");
         }
 
         let index = build_dir_index(dir, self.strict_utf8, self.current_dir_index_generation())?;
-        let mut cache = self.cache.borrow_mut();
-        cache.insert(index.clone());
+        let mut cache = self.dir_cache.write().expect("dir_cache lock poisoned");
+        cache.insert(index.dir_id, index.clone());
+        evict_if_needed(&mut cache, self.cache_max_entries);
         Ok(index)
     }
 
-    fn bump_op_generation(&self) {
-        let value = self.op_generation.get().wrapping_add(1);
-        self.op_generation.set(value);
-    }
-
     fn invalidate_dir_index(&self, dir: &Path) {
+        // OS metadata lookup happens without holding the cache lock.
         if let Ok(meta) = fs::metadata(dir) {
             let dir_id = (meta.dev(), meta.ino());
-            self.cache.borrow_mut().remove(&dir_id);
+            let mut cache = self.dir_cache.write().expect("dir_cache lock poisoned");
+            cache.remove(&dir_id);
         }
+    }
+
+    fn begin_execute(&self) {
+        // Lock ordering: mutation_lock -> (optional) dir_cache write.
+        // We never hold this lock across OS calls; it only guards generation bumps.
+        let _guard = self.mutation_lock.lock().expect("mutation_lock poisoned");
+        self.op_generation.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -794,9 +817,11 @@ impl Resolver for LinuxResolver {
         if mapping.is_none() {
             return ResolverStatus::InvalidPath;
         }
-        let mut generations = self.generations.get();
-        generations.root_mapping_generation = generations.root_mapping_generation.wrapping_add(1);
-        self.generations.set(generations);
+        {
+            let mut generations = self.generations.write().expect("generations lock poisoned");
+            generations.root_mapping_generation =
+                generations.root_mapping_generation.wrapping_add(1);
+        }
         self.invalidate_cache_if_needed();
         ResolverStatus::Ok
     }
@@ -858,6 +883,8 @@ impl Resolver for LinuxResolver {
                     plan_out.flags = flags;
                     plan_out.status = ResolverStatus::Ok;
                     plan_out.would_error = ResolverStatus::Ok;
+                    plan_out.plan_token.op_generation =
+                        self.op_generation.load(Ordering::Acquire);
                     if let Err(status) = set_plan_paths(plan_out, &info.path) {
                         plan_out.status = status;
                         plan_out.would_error = status;
@@ -872,6 +899,8 @@ impl Resolver for LinuxResolver {
                     init_plan(plan_out);
                     plan_out.status = status;
                     plan_out.would_error = status;
+                    plan_out.plan_token.op_generation =
+                        self.op_generation.load(Ordering::Acquire);
                 }
                 status
             }
@@ -885,7 +914,7 @@ impl Resolver for LinuxResolver {
         out_result: *mut ResolverResult,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        self.bump_op_generation();
+        self.begin_execute();
         let base_dir = match string_view_to_string(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
@@ -970,7 +999,7 @@ impl Resolver for LinuxResolver {
         out_result: *mut ResolverResult,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        self.bump_op_generation();
+        self.begin_execute();
         let base_dir = match string_view_to_string(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
@@ -1031,7 +1060,7 @@ impl Resolver for LinuxResolver {
         out_result: *mut ResolverResult,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        self.bump_op_generation();
+        self.begin_execute();
         let base_dir = match string_view_to_string(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
@@ -1079,6 +1108,7 @@ impl Resolver for LinuxResolver {
         out_resolved_path: *mut ResolverResolvedPath,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
+        self.begin_execute();
         let base_dir = match string_view_to_string(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
@@ -1133,13 +1163,7 @@ impl Resolver for LinuxResolver {
         if out_fd.is_null() {
             return ResolverStatus::InvalidPath;
         }
-        let mutating_intent = matches!(
-            intent,
-            ResolverIntent::WriteAppend | ResolverIntent::WriteTruncate | ResolverIntent::CreateNew
-        );
-        if mutating_intent {
-            self.bump_op_generation();
-        }
+        self.begin_execute();
         let base_dir = match string_view_to_string(base_dir) {
             Ok(value) => value,
             Err(status) => return status,
@@ -1188,11 +1212,38 @@ impl Resolver for LinuxResolver {
 
     fn execute_from_plan(
         &self,
-        _plan: *const ResolverPlan,
+        plan: *const ResolverPlan,
         _out_result: *mut ResolverResult,
         _out_diag: *mut ResolverDiag,
     ) -> ResolverStatus {
-        // TODO(linux): validate plan token (generations + dir generations) and execute.
+        let plan = unsafe { plan.as_ref() }.ok_or(ResolverStatus::InvalidPath);
+        let plan = match plan {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+
+        // Lock ordering: mutation_lock -> (optional) dir_cache write.
+        // Validation happens under mutation_lock to prevent concurrent execute
+        // operations from interleaving generation checks.
+        let _guard = self.mutation_lock.lock().expect("mutation_lock poisoned");
+
+        // TODO(sync): once execute_from_plan is implemented, validate full plan token
+        // generations and per-directory DirGeneration as required by §12.5.
+        let expected_token_size = std::mem::size_of::<ResolverPlanToken>() as u32;
+        let expected_plan_size = std::mem::size_of::<ResolverPlan>() as u32;
+        if plan.size < expected_plan_size || plan.plan_token.size < expected_token_size {
+            return ResolverStatus::StalePlan;
+        }
+
+        let current = self.op_generation.load(Ordering::Acquire);
+        if plan.plan_token.op_generation != current {
+            return ResolverStatus::StalePlan;
+        }
+
+        // Increment at the start of the mutation phase (before any filesystem mutation).
+        self.op_generation.fetch_add(1, Ordering::AcqRel);
+
+        // TODO(linux): execute mutation based on plan intent and resolved paths.
         ResolverStatus::IoError
     }
 
