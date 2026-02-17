@@ -198,3 +198,13 @@ pub extern "C" fn resolver_free_string(value: ResolverStringView) {
         libc::free(value.ptr as *mut libc::c_void);
     }
 }
+
+#[no_mangle]
+pub extern "C" fn resolver_free_buffer(value: ResolverBufferView) {
+    if value.ptr.is_null() {
+        return;
+    }
+    unsafe {
+        libc::free(value.ptr as *mut libc::c_void);
+    }
+}

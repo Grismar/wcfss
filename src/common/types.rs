@@ -1,4 +1,5 @@
 use core::ffi::c_char;
+use core::ffi::c_void;
 
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -64,9 +65,25 @@ pub struct ResolverStringView {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct ResolverBufferView {
+    pub ptr: *const c_void,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ResolverDirGeneration {
+    pub dev: u64,
+    pub ino: u64,
+    pub generation: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct ResolverPlanToken {
     pub size: u32,
     pub op_generation: u64,
+    pub dir_generations: ResolverBufferView,
     pub reserved: [u64; 6],
 }
 

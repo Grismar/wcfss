@@ -54,6 +54,8 @@ pub struct DirIndex {
     pub built_at: Instant,
     #[allow(dead_code)]
     pub dir_index_generation: u64,
+    #[allow(dead_code)]
+    pub dir_generation: u64,
 }
 
 pub fn insert_entry(map: &mut HashMap<String, EntrySet>, key: String, name: String) -> bool {

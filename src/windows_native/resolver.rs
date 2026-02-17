@@ -196,6 +196,10 @@ fn init_plan(plan: &mut ResolverPlan) {
     plan.plan_token = ResolverPlanToken {
         size: std::mem::size_of::<ResolverPlanToken>() as u32,
         op_generation: 0,
+        dir_generations: ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
         reserved: [0; 6],
     };
     plan.reserved = [0; 6];

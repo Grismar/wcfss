@@ -32,6 +32,17 @@ struct ComponentSelection {
     meta: fs::Metadata,
 }
 
+#[derive(Debug, Default)]
+struct PlanTrace {
+    dir_generations: HashMap<(u64, u64), u64>,
+}
+
+impl PlanTrace {
+    fn record(&mut self, dir_id: (u64, u64), generation: u64) {
+        self.dir_generations.entry(dir_id).or_insert(generation);
+    }
+}
+
 fn map_io_error(err: &io::Error) -> ResolverStatus {
     use io::ErrorKind;
     if let Some(code) = err.raw_os_error() {
@@ -67,6 +78,7 @@ fn build_dir_index(
     dir: &Path,
     strict_utf8: bool,
     dir_index_generation: u64,
+    dir_generation: u64,
 ) -> Result<DirIndex, ResolverStatus> {
     trace(&format!("DirIndex build start: {}", dir.display()));
     let mut map: HashMap<String, EntrySet> = HashMap::new();
@@ -125,6 +137,7 @@ fn build_dir_index(
         stamp,
         built_at: Instant::now(),
         dir_index_generation,
+        dir_generation,
     })
 }
 
@@ -158,9 +171,50 @@ fn init_plan(plan: &mut ResolverPlan) {
     plan.plan_token = ResolverPlanToken {
         size: std::mem::size_of::<ResolverPlanToken>() as u32,
         op_generation: 0,
+        dir_generations: ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
         reserved: [0; 6],
     };
     plan.reserved = [0; 6];
+}
+
+fn write_plan_dir_generations(
+    plan: &mut ResolverPlan,
+    trace: &PlanTrace,
+) -> Result<(), ResolverStatus> {
+    // TODO(sync): caller is responsible for freeing any previous plan_token buffer
+    // via resolver_free_buffer before reusing the plan.
+    if trace.dir_generations.is_empty() {
+        plan.plan_token.dir_generations = ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        return Ok(());
+    }
+    let count = trace.dir_generations.len();
+    let bytes = count * std::mem::size_of::<ResolverDirGeneration>();
+    let ptr = unsafe { libc::malloc(bytes) } as *mut ResolverDirGeneration;
+    if ptr.is_null() {
+        return Err(ResolverStatus::IoError);
+    }
+    let mut entries: Vec<ResolverDirGeneration> = Vec::with_capacity(count);
+    for (dir_id, generation) in trace.dir_generations.iter() {
+        entries.push(ResolverDirGeneration {
+            dev: dir_id.0,
+            ino: dir_id.1,
+            generation: *generation,
+        });
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(entries.as_ptr(), ptr, count);
+    }
+    plan.plan_token.dir_generations = ResolverBufferView {
+        ptr: ptr as *const core::ffi::c_void,
+        len: count,
+    };
+    Ok(())
 }
 
 fn write_string_view(value: &str, out: &mut ResolverStringView) -> Result<(), ResolverStatus> {
@@ -290,15 +344,21 @@ fn select_component(
     resolver: &LinuxResolver,
     current: &Path,
     component: &str,
+    plan_trace: Option<&mut PlanTrace>,
 ) -> Result<Option<ComponentSelection>, ResolverStatus> {
     let exact_path = current.join(component);
     match fs::symlink_metadata(&exact_path) {
-        Ok(meta) => Ok(Some(ComponentSelection {
-            name: component.to_string(),
-            meta,
-        })),
+        Ok(meta) => {
+            if let Some(plan_trace) = plan_trace {
+                resolver.record_dir_generation_for_path(current, plan_trace);
+            }
+            Ok(Some(ComponentSelection {
+                name: component.to_string(),
+                meta,
+            }))
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let index = resolver.get_dir_index(current)?;
+            let index = resolver.get_dir_index(current, plan_trace)?;
             let key = parser::key_simple_uppercase(component);
             match index.fold_map.get(&key) {
                 None => Ok(None),
@@ -325,6 +385,7 @@ fn resolve_path(
     base_dir: &Path,
     input_path: &str,
     intent: ResolverIntent,
+    mut plan_trace: Option<&mut PlanTrace>,
 ) -> Result<ResolvedInfo, ResolverStatus> {
     if input_path.as_bytes().len() > MAX_INPUT_PATH_BYTES {
         return Err(ResolverStatus::PathTooLong);
@@ -393,7 +454,7 @@ fn resolve_path(
         let selection = if intent == ResolverIntent::Mkdirs && creating {
             None
         } else {
-            match select_component(resolver, &current, component) {
+            match select_component(resolver, &current, component, plan_trace.as_deref_mut()) {
                 Ok(value) => value,
                 Err(status) => return Err(status),
             }
@@ -528,6 +589,7 @@ fn plan_mkdirs(
     resolver: &LinuxResolver,
     base_dir: &Path,
     input_path: &str,
+    mut plan_trace: Option<&mut PlanTrace>,
 ) -> Result<MkdirPlan, ResolverStatus> {
     if input_path.as_bytes().len() > MAX_INPUT_PATH_BYTES {
         return Err(ResolverStatus::PathTooLong);
@@ -603,7 +665,9 @@ fn plan_mkdirs(
             current.display()
         ));
 
-        let selection = match select_component(resolver, &current, component) {
+        let selection =
+            match select_component(resolver, &current, component, plan_trace.as_deref_mut())
+        {
             Ok(value) => value,
             Err(status) => return Err(status),
         };
@@ -697,6 +761,7 @@ pub struct LinuxResolver {
     cache_generation: AtomicU64,
     op_generation: AtomicU64,
     mutation_lock: Mutex<()>,
+    dir_generations: RwLock<HashMap<(u64, u64), u64>>,
 }
 
 impl LinuxResolver {
@@ -725,6 +790,7 @@ impl LinuxResolver {
             cache_generation: AtomicU64::new(cache_generation),
             op_generation: AtomicU64::new(0),
             mutation_lock: Mutex::new(()),
+            dir_generations: RwLock::new(HashMap::new()),
         }
     }
 
@@ -743,7 +809,11 @@ impl LinuxResolver {
         }
     }
 
-    fn get_dir_index(&self, dir: &Path) -> Result<DirIndex, ResolverStatus> {
+    fn get_dir_index(
+        &self,
+        dir: &Path,
+        plan_trace: Option<&mut PlanTrace>,
+    ) -> Result<DirIndex, ResolverStatus> {
         // Locking strategy:
         // - Never hold dir_cache locks during OS calls (metadata/read_dir).
         // - Use a read lock for cache lookups.
@@ -753,6 +823,10 @@ impl LinuxResolver {
         let dir_id = (meta.dev(), meta.ino());
         let stamp = DirStamp::from_meta(&meta);
         let now = Instant::now();
+        let dir_generation = self.current_dir_generation(dir_id);
+        if let Some(plan_trace) = plan_trace {
+            plan_trace.record(dir_id, dir_generation);
+        }
 
         let cached = {
             let cache = self.dir_cache.read().expect("dir_cache lock poisoned");
@@ -783,7 +857,12 @@ impl LinuxResolver {
             trace("DirIndex cache miss; building.");
         }
 
-        let index = build_dir_index(dir, self.strict_utf8, self.current_dir_index_generation())?;
+        let index = build_dir_index(
+            dir,
+            self.strict_utf8,
+            self.current_dir_index_generation(),
+            dir_generation,
+        )?;
         let mut cache = self.dir_cache.write().expect("dir_cache lock poisoned");
         cache.insert(index.dir_id, index.clone());
         evict_if_needed(&mut cache, self.cache_max_entries);
@@ -804,6 +883,52 @@ impl LinuxResolver {
         // We never hold this lock across OS calls; it only guards generation bumps.
         let _guard = self.mutation_lock.lock().expect("mutation_lock poisoned");
         self.op_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn current_dir_generation(&self, dir_id: (u64, u64)) -> u64 {
+        {
+            let generations = self
+                .dir_generations
+                .read()
+                .expect("dir_generations lock poisoned");
+            if let Some(value) = generations.get(&dir_id) {
+                return *value;
+            }
+        }
+        let mut generations = self
+            .dir_generations
+            .write()
+            .expect("dir_generations lock poisoned");
+        *generations.entry(dir_id).or_insert(0)
+    }
+
+    fn record_dir_generation_for_path(&self, path: &Path, plan_trace: &mut PlanTrace) {
+        if let Ok(meta) = fs::metadata(path) {
+            let dir_id = (meta.dev(), meta.ino());
+            let generation = self.current_dir_generation(dir_id);
+            plan_trace.record(dir_id, generation);
+        }
+    }
+
+    fn bump_dir_generations_for_paths(&self, paths: &[PathBuf]) {
+        // OS metadata lookup happens without holding the dir_generations lock.
+        let mut dir_ids = Vec::new();
+        for path in paths {
+            if let Ok(meta) = fs::metadata(path) {
+                dir_ids.push((meta.dev(), meta.ino()));
+            }
+        }
+        if dir_ids.is_empty() {
+            return;
+        }
+        let mut generations = self
+            .dir_generations
+            .write()
+            .expect("dir_generations lock poisoned");
+        for dir_id in dir_ids {
+            let entry = generations.entry(dir_id).or_insert(0);
+            *entry = entry.wrapping_add(1);
+        }
     }
 }
 
@@ -855,7 +980,14 @@ impl Resolver for LinuxResolver {
 
         let plan_out = unsafe { out_plan.as_mut() };
 
-        match resolve_path(self, &base_dir_path, &input_path, intent) {
+        let mut plan_trace = PlanTrace::default();
+        match resolve_path(
+            self,
+            &base_dir_path,
+            &input_path,
+            intent,
+            Some(&mut plan_trace),
+        ) {
             Ok(info) => {
                 trace(&format!(
                     "Plan resolved: path='{}', exists={}, is_dir={}, would_create={}, would_truncate={}",
@@ -885,6 +1017,11 @@ impl Resolver for LinuxResolver {
                     plan_out.would_error = ResolverStatus::Ok;
                     plan_out.plan_token.op_generation =
                         self.op_generation.load(Ordering::Acquire);
+                    if let Err(status) = write_plan_dir_generations(plan_out, &plan_trace) {
+                        plan_out.status = status;
+                        plan_out.would_error = status;
+                        return status;
+                    }
                     if let Err(status) = set_plan_paths(plan_out, &info.path) {
                         plan_out.status = status;
                         plan_out.would_error = status;
@@ -901,6 +1038,7 @@ impl Resolver for LinuxResolver {
                     plan_out.would_error = status;
                     plan_out.plan_token.op_generation =
                         self.op_generation.load(Ordering::Acquire);
+                    let _ = write_plan_dir_generations(plan_out, &plan_trace);
                 }
                 status
             }
@@ -933,7 +1071,7 @@ impl Resolver for LinuxResolver {
             out.reserved = [0; 6];
         }
 
-        let plan = match plan_mkdirs(self, &base_dir_path, &input_path) {
+        let plan = match plan_mkdirs(self, &base_dir_path, &input_path, None) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -954,6 +1092,9 @@ impl Resolver for LinuxResolver {
             plan.create_paths.len(),
             plan.final_path.display()
         ));
+
+        let parents: Vec<PathBuf> = parents_to_invalidate.iter().cloned().collect();
+        self.bump_dir_generations_for_paths(&parents);
 
         for create_path in &plan.create_paths {
             match fs::create_dir(create_path) {
@@ -1022,13 +1163,13 @@ impl Resolver for LinuxResolver {
             out.reserved = [0; 6];
         }
 
-        let source = match resolve_path(self, &base_dir_path, &from_path, ResolverIntent::Read) {
+        let source = match resolve_path(self, &base_dir_path, &from_path, ResolverIntent::Read, None) {
             Ok(value) => value,
             Err(status) => return status,
         };
 
         let destination =
-            match resolve_path(self, &base_dir_path, &to_path, ResolverIntent::WriteTruncate) {
+            match resolve_path(self, &base_dir_path, &to_path, ResolverIntent::WriteTruncate, None) {
                 Ok(value) => value,
                 Err(status) => return status,
             };
@@ -1038,6 +1179,15 @@ impl Resolver for LinuxResolver {
             source.path.display(),
             destination.path.display()
         ));
+
+        let mut parents = Vec::new();
+        if let Some(parent) = source.path.parent() {
+            parents.push(parent.to_path_buf());
+        }
+        if let Some(parent) = destination.path.parent() {
+            parents.push(parent.to_path_buf());
+        }
+        self.bump_dir_generations_for_paths(&parents);
 
         if let Err(err) = fs::rename(&source.path, &destination.path) {
             return map_io_error(&err);
@@ -1079,7 +1229,7 @@ impl Resolver for LinuxResolver {
             out.reserved = [0; 6];
         }
 
-        let info = match resolve_path(self, &base_dir_path, &input_path, ResolverIntent::Read) {
+        let info = match resolve_path(self, &base_dir_path, &input_path, ResolverIntent::Read, None) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -1091,6 +1241,9 @@ impl Resolver for LinuxResolver {
             "execute_unlink deleting '{}'",
             info.path.display()
         ));
+        if let Some(parent) = info.path.parent() {
+            self.bump_dir_generations_for_paths(&[parent.to_path_buf()]);
+        }
         if let Err(err) = fs::remove_file(&info.path) {
             return map_io_error(&err);
         }
@@ -1122,7 +1275,7 @@ impl Resolver for LinuxResolver {
             Err(status) => return status,
         };
 
-        let info = match resolve_path(self, &base_dir_path, &input_path, intent) {
+        let info = match resolve_path(self, &base_dir_path, &input_path, intent, None) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -1177,7 +1330,7 @@ impl Resolver for LinuxResolver {
             Err(status) => return status,
         };
 
-        let info = match resolve_path(self, &base_dir_path, &input_path, intent) {
+        let info = match resolve_path(self, &base_dir_path, &input_path, intent, None) {
             Ok(value) => value,
             Err(status) => return status,
         };
@@ -1194,6 +1347,11 @@ impl Resolver for LinuxResolver {
             Ok(value) => value,
             Err(_) => return ResolverStatus::InvalidPath,
         };
+        if info.would_create {
+            if let Some(parent) = info.path.parent() {
+                self.bump_dir_generations_for_paths(&[parent.to_path_buf()]);
+            }
+        }
         let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o666) };
         if fd < 0 {
             let err = io::Error::last_os_error();
@@ -1238,6 +1396,26 @@ impl Resolver for LinuxResolver {
         let current = self.op_generation.load(Ordering::Acquire);
         if plan.plan_token.op_generation != current {
             return ResolverStatus::StalePlan;
+        }
+
+        let dir_view = plan.plan_token.dir_generations;
+        if dir_view.len > 0 && dir_view.ptr.is_null() {
+            return ResolverStatus::StalePlan;
+        }
+        if dir_view.len > 0 {
+            let entries = unsafe {
+                std::slice::from_raw_parts(
+                    dir_view.ptr as *const ResolverDirGeneration,
+                    dir_view.len,
+                )
+            };
+            for entry in entries {
+                let dir_id = (entry.dev, entry.ino);
+                let current = self.current_dir_generation(dir_id);
+                if current != entry.generation {
+                    return ResolverStatus::StalePlan;
+                }
+            }
         }
 
         // Increment at the start of the mutation phase (before any filesystem mutation).
