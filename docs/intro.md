@@ -100,3 +100,12 @@ If you are new to the codebase, a good reading order is:
 ## Future Bindings
 
 Bindings will be thin adapters around the C ABI. When bindings are added, this doc should gain a short section describing how those bindings map to `ResolverStringView`, `ResolverPlan`, and the free functions (`resolver_free_string`, `resolver_free_buffer`).
+
+## Bindings (Current)
+
+This repository now includes initial bindings under `bindings/`:
+- `bindings/fortran/wcfss.f90`: ISO_C_BINDING module with wrappers and string conversions.
+- `bindings/python/wcfss.py`: `ctypes` wrapper with Pythonic API and exceptions.
+- `bindings/rust/lib.rs`: safe wrapper over the C ABI with `Drop` and `Result` mapping.
+
+These bindings are thin and intentionally map 1:1 to the C ABI described in §19 of `docs/spec.md`. They do not introduce behavioral changes; they only handle ownership rules, type conversions, and error handling.

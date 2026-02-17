@@ -25,6 +25,17 @@ wcfss/
 │   ├── linux/              # Linux-specific tests
 │   ├── windows.rs          # Test harness for Windows targets
 │   └── linux.rs            # Test harness for Linux targets
+├── bindings/
+│   ├── fortran/
+│   │   ├── wcfss.f90
+│   │   └── README.md
+│   ├── python/
+│   │   ├── __init__.py
+│   │   ├── wcfss.py
+│   │   └── README.md
+│   └── rust/
+│       ├── lib.rs
+│       └── README.md
 └── docs/
     ├── spec.md
     ├── environment.md
