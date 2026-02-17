@@ -801,11 +801,11 @@ impl LinuxResolver {
 
     fn invalidate_cache_if_needed(&self) {
         let current = self.current_dir_index_generation();
-        if self.cache_generation.load(Ordering::Acquire) != current {
+        if self.cache_generation.load(Ordering::SeqCst) != current {
             trace("DirIndex generation changed; clearing cache.");
             let mut cache = self.dir_cache.write().expect("dir_cache lock poisoned");
             cache.clear();
-            self.cache_generation.store(current, Ordering::Release);
+            self.cache_generation.store(current, Ordering::SeqCst);
         }
     }
 
@@ -882,7 +882,7 @@ impl LinuxResolver {
         // Lock ordering: mutation_lock -> (optional) dir_cache write.
         // We never hold this lock across OS calls; it only guards generation bumps.
         let _guard = self.mutation_lock.lock().expect("mutation_lock poisoned");
-        self.op_generation.fetch_add(1, Ordering::AcqRel);
+        self.op_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     fn current_dir_generation(&self, dir_id: (u64, u64)) -> u64 {
@@ -1016,7 +1016,7 @@ impl Resolver for LinuxResolver {
                     plan_out.status = ResolverStatus::Ok;
                     plan_out.would_error = ResolverStatus::Ok;
                     plan_out.plan_token.op_generation =
-                        self.op_generation.load(Ordering::Acquire);
+                        self.op_generation.load(Ordering::SeqCst);
                     if let Err(status) = write_plan_dir_generations(plan_out, &plan_trace) {
                         plan_out.status = status;
                         plan_out.would_error = status;
@@ -1037,7 +1037,7 @@ impl Resolver for LinuxResolver {
                     plan_out.status = status;
                     plan_out.would_error = status;
                     plan_out.plan_token.op_generation =
-                        self.op_generation.load(Ordering::Acquire);
+                        self.op_generation.load(Ordering::SeqCst);
                     let _ = write_plan_dir_generations(plan_out, &plan_trace);
                 }
                 status
@@ -1393,7 +1393,7 @@ impl Resolver for LinuxResolver {
             return ResolverStatus::StalePlan;
         }
 
-        let current = self.op_generation.load(Ordering::Acquire);
+        let current = self.op_generation.load(Ordering::SeqCst);
         if plan.plan_token.op_generation != current {
             return ResolverStatus::StalePlan;
         }
@@ -1419,7 +1419,7 @@ impl Resolver for LinuxResolver {
         }
 
         // Increment at the start of the mutation phase (before any filesystem mutation).
-        self.op_generation.fetch_add(1, Ordering::AcqRel);
+        self.op_generation.fetch_add(1, Ordering::SeqCst);
 
         // TODO(linux): execute mutation based on plan intent and resolved paths.
         ResolverStatus::IoError
