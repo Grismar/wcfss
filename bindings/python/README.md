@@ -12,6 +12,23 @@ The shared library must be discoverable. You can:
 - Set `WCFSS_LIB=/path/to/libwcfss.so` (or `.dylib`, `.dll`)
 - Or rely on system library search paths
 
+## Install (editable, recommended for local dev)
+
+This repo includes minimal packaging metadata so you can install directly from
+the source tree and pull updates later:
+
+```bash
+pip install -e /path/to/wcfss/bindings/python
+```
+
+Then update the repo with `git pull` and your Python environment will see the
+latest bindings without copying files.
+
+Notes:
+- Versioning: keep this in sync with the core crate when cutting releases.
+- Branch switching: if you change branches and see stale behavior, run
+  `pip uninstall -y wcfss` then `pip install -e /path/to/wcfss/bindings/python`.
+
 ## Usage
 
 ```python

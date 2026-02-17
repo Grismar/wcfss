@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wcfss"
+version = "0.1.0"
+description = "Python ctypes bindings for wcfss"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[tool.setuptools]
+packages = ["wcfss"]
+package-dir = { "wcfss" = "." }
