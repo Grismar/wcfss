@@ -115,7 +115,7 @@ unsafe fn string_view_to_string(view: *const ResolverStringView) -> Result<Strin
 }
 
 fn base_dir_from_view(view: *const ResolverStringView) -> Result<String, ResolverStatus> {
-    string_view_to_string(view).map_err(|_| ResolverStatus::BaseDirInvalid)
+    unsafe { string_view_to_string(view) }.map_err(|_| ResolverStatus::BaseDirInvalid)
 }
 
 fn validate_base_dir(base_dir: &str) -> Result<(), ResolverStatus> {
