@@ -401,6 +401,45 @@ fn write_string_view(value: &str, out: &mut ResolverStringView) -> Result<(), Re
     Ok(())
 }
 
+fn write_string_list(values: &[String], out: &mut ResolverStringList) -> Result<(), ResolverStatus> {
+    out.size = std::mem::size_of::<ResolverStringList>() as u32;
+    out.count = values.len();
+    out.entries = ResolverBufferView {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    if values.is_empty() {
+        return Ok(());
+    }
+    let count = values.len();
+    let bytes = count * std::mem::size_of::<ResolverStringView>();
+    let ptr = unsafe { libc::malloc(bytes) } as *mut ResolverStringView;
+    if ptr.is_null() {
+        return Err(ResolverStatus::IoError);
+    }
+    let views = unsafe { std::slice::from_raw_parts_mut(ptr, count) };
+    for view in views.iter_mut() {
+        view.ptr = std::ptr::null();
+        view.len = 0;
+    }
+    for (idx, value) in values.iter().enumerate() {
+        if write_string_view(value, &mut views[idx]).is_err() {
+            for view in views.iter() {
+                if !view.ptr.is_null() {
+                    unsafe { libc::free(view.ptr as *mut libc::c_void) };
+                }
+            }
+            unsafe { libc::free(ptr as *mut libc::c_void) };
+            return Err(ResolverStatus::IoError);
+        }
+    }
+    out.entries = ResolverBufferView {
+        ptr: ptr as *const core::ffi::c_void,
+        len: count,
+    };
+    Ok(())
+}
+
 fn set_plan_paths(plan: &mut ResolverPlan, resolved: &Path) -> Result<(), ResolverStatus> {
     let parent = resolved.parent().unwrap_or(resolved);
     let parent_str = parent.to_string_lossy();
@@ -896,6 +935,205 @@ fn resolve_path(
     }
 
     Err(ResolverStatus::InvalidPath)
+}
+
+fn resolve_parent_and_leaf_for_matches(
+    resolver: &LinuxResolver,
+    base_dir: &str,
+    input_path: &str,
+    mut diag: Option<&mut DiagCollector>,
+) -> Result<(PathBuf, String), ResolverStatus> {
+    if input_path.as_bytes().len() > MAX_INPUT_PATH_BYTES {
+        return Err(ResolverStatus::PathTooLong);
+    }
+
+    let (normalized, had_backslash) = normalize_input(input_path);
+    if had_backslash {
+        trace("Input contained backslashes; normalized to forward slashes.");
+        if let Some(diag) = diag.as_deref_mut() {
+            diag.push(
+                ResolverDiagCode::BackslashNormalized,
+                ResolverDiagSeverity::Warning,
+                input_path.to_string(),
+                "input contained backslashes".to_string(),
+            );
+        }
+    }
+
+    let (root, skip_components) = match resolver.classify_root(&normalized) {
+        Ok(value) => value,
+        Err(status) => {
+            if let Some(diag) = diag.as_deref_mut() {
+                match status {
+                    ResolverStatus::UnsupportedAbsolutePath => diag.push(
+                        ResolverDiagCode::UnsupportedAbsolutePath,
+                        ResolverDiagSeverity::Error,
+                        input_path.to_string(),
+                        "unsupported absolute path".to_string(),
+                    ),
+                    ResolverStatus::UnmappedRoot => diag.push(
+                        ResolverDiagCode::UnmappedRoot,
+                        ResolverDiagSeverity::Error,
+                        input_path.to_string(),
+                        "unmapped root".to_string(),
+                    ),
+                    _ => {}
+                }
+            }
+            return Err(status);
+        }
+    };
+    if let Err(status) = precheck_escapes_root(&normalized, skip_components) {
+        if let Some(diag) = diag.as_deref_mut() {
+            diag.push(
+                ResolverDiagCode::EscapesRoot,
+                ResolverDiagSeverity::Error,
+                input_path.to_string(),
+                "path escapes root".to_string(),
+            );
+        }
+        return Err(status);
+    }
+
+    let base_dir_path = validate_base_dir(base_dir)?;
+    let mut current = root.unwrap_or_else(|| base_dir_path.to_path_buf());
+    let mut stack: Vec<(PathBuf, bool)> = vec![(current.clone(), false)];
+
+    let mut components: Vec<&str> = Vec::new();
+    let mut skipped = 0usize;
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if skipped < skip_components {
+            skipped += 1;
+            continue;
+        }
+        if part.as_bytes().len() > MAX_COMPONENT_BYTES {
+            return Err(ResolverStatus::PathTooLong);
+        }
+        components.push(part);
+        if components.len() > MAX_COMPONENTS {
+            return Err(ResolverStatus::PathTooLong);
+        }
+    }
+
+    if components.is_empty() {
+        return Err(ResolverStatus::InvalidPath);
+    }
+    if *components.last().unwrap() == ".." {
+        return Err(ResolverStatus::InvalidPath);
+    }
+
+    let mut visited_symlinks: HashSet<(u64, u64)> = HashSet::new();
+    let mut symlink_depth = 0usize;
+
+    for (idx, component) in components.iter().enumerate() {
+        let is_last = idx + 1 == components.len();
+        if is_last {
+            break;
+        }
+        if *component == ".." {
+            if stack.len() <= 1 {
+                trace("Encountered .. at root boundary.");
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::EscapesRoot,
+                        ResolverDiagSeverity::Error,
+                        current.display().to_string(),
+                        "path escapes root".to_string(),
+                    );
+                }
+                return Err(ResolverStatus::EscapesRoot);
+            }
+            let (_, was_symlink) = stack.pop().unwrap();
+            if was_symlink {
+                trace("Encountered .. across symlink boundary.");
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::SymlinkLoop,
+                        ResolverDiagSeverity::Error,
+                        current.display().to_string(),
+                        "path traversed across symlink boundary".to_string(),
+                    );
+                }
+                return Err(ResolverStatus::InvalidPath);
+            }
+            current = stack.last().unwrap().0.clone();
+            continue;
+        }
+
+        trace(&format!(
+            "Resolving component '{}' in {}",
+            component,
+            current.display()
+        ));
+        let selection = match select_component(resolver, &current, component, None, diag.as_deref_mut()) {
+            Ok(value) => value,
+            Err(status) => return Err(status),
+        };
+        let (selected_name, selected_meta, missing_component) = match selection {
+            Some(entry) => (entry.name, Some(entry.meta), false),
+            None => (component.to_string(), None, true),
+        };
+
+        if missing_component {
+            return Err(ResolverStatus::NotFound);
+        }
+
+        let next_path = current.join(&selected_name);
+        let selected_meta = selected_meta.as_ref().expect("meta for existing entry");
+        if selected_meta.file_type().is_symlink() {
+            trace(&format!("Encountered symlink: {}", next_path.display()));
+            let dev = selected_meta.dev();
+            let ino = selected_meta.ino();
+            if visited_symlinks.contains(&(dev, ino)) {
+                trace(&format!(
+                    "Symlink cycle detected at dev={}, ino={}.",
+                    dev, ino
+                ));
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::SymlinkLoop,
+                        ResolverDiagSeverity::Error,
+                        next_path.display().to_string(),
+                        "symlink cycle detected".to_string(),
+                    );
+                }
+                return Err(ResolverStatus::TooManySymlinks);
+            }
+            if symlink_depth >= SYMLINK_DEPTH_LIMIT {
+                trace(&format!(
+                    "Symlink depth limit exceeded (limit={SYMLINK_DEPTH_LIMIT})."
+                ));
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.push(
+                        ResolverDiagCode::SymlinkLoop,
+                        ResolverDiagSeverity::Error,
+                        next_path.display().to_string(),
+                        "symlink depth limit exceeded".to_string(),
+                    );
+                }
+                return Err(ResolverStatus::TooManySymlinks);
+            }
+            visited_symlinks.insert((dev, ino));
+            symlink_depth += 1;
+            trace(&format!(
+                "Symlink visit recorded (depth={}, dev={}, ino={}).",
+                symlink_depth, dev, ino
+            ));
+        }
+
+        let meta = fs::metadata(&next_path).map_err(|err| map_io_error(&err))?;
+        if !meta.is_dir() {
+            trace("Intermediate component is not a directory.");
+            return Err(ResolverStatus::NotADirectory);
+        }
+        stack.push((next_path.clone(), selected_meta.file_type().is_symlink()));
+        current = next_path;
+    }
+
+    Ok((current, components.last().unwrap().to_string()))
 }
 
 fn plan_mkdirs(
@@ -2237,6 +2475,85 @@ impl Resolver for LinuxResolver {
                 ResolverStatus::InvalidPath
             }
         }
+    }
+
+    fn find_matches(
+        &self,
+        base_dir: *const ResolverStringView,
+        input_path: *const ResolverStringView,
+        out_list: *mut ResolverStringList,
+        out_diag: *mut ResolverDiag,
+    ) -> ResolverStatus {
+        let out_list = unsafe { out_list.as_mut() };
+        let out_list = match out_list {
+            Some(out) => out,
+            None => return ResolverStatus::InvalidPath,
+        };
+        out_list.size = std::mem::size_of::<ResolverStringList>() as u32;
+        out_list.entries = ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        out_list.count = 0;
+        out_list.reserved = [0; 4];
+
+        let input_path = match string_view_to_string(input_path) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let base_dir = match base_dir_from_view(base_dir) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+
+        let mut diag = DiagCollector::default();
+        let (parent, leaf) = match resolve_parent_and_leaf_for_matches(
+            self,
+            &base_dir,
+            &input_path,
+            Some(&mut diag),
+        ) {
+            Ok(value) => value,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
+        };
+
+        let index = match self.get_dir_index(&parent, None, Some(&mut diag)) {
+            Ok(value) => value,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
+        };
+        let key = parser::key_simple_uppercase(&leaf);
+        let names: Vec<String> = match index.fold_map.get(&key) {
+            None => Vec::new(),
+            Some(EntrySet::Unique(name)) => vec![name.clone()],
+            Some(EntrySet::Ambiguous(list)) => list.clone(),
+        };
+
+        if names.len() > 1 {
+            diag.push(
+                ResolverDiagCode::Collision,
+                ResolverDiagSeverity::Warning,
+                parent.display().to_string(),
+                names.join(", "),
+            );
+        }
+
+        let mut paths = Vec::with_capacity(names.len());
+        for name in names {
+            paths.push(parent.join(name).to_string_lossy().into_owned());
+        }
+
+        if let Err(status) = write_string_list(&paths, out_list) {
+            write_diag_entries(out_diag, &diag);
+            return status;
+        }
+        write_diag_entries(out_diag, &diag);
+        ResolverStatus::Ok
     }
 
     fn get_metrics(&self, out_metrics: *mut ResolverMetrics) -> ResolverStatus {

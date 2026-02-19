@@ -529,6 +529,7 @@ Minimum:
 Optional:
 - `resolver_execute_open_return_fd(handle, base_dir, input_path, intent, out_fd, out_diag) -> status`
 - `resolver_execute_from_plan(handle, plan, out_result, out_diag) -> status`
+- `resolver_find_matches(handle, base_dir, input_path, out_list, out_diag) -> status`
 - `resolver_log_set_stderr(level) -> status`
 - `resolver_log_set_callback(callback, user_data, level) -> status`
 - `resolver_log_set_level(level) -> status`
@@ -558,7 +559,21 @@ If logging callbacks are exposed via the C ABI, the recommended types are:
 - `ResolverLogRecord`: `{ level, target, message, file, line }` where all strings are `ResolverStringView`.
 - Callback signature: `void (*)(const ResolverLogRecord *record, void *user_data)`.
 
-### 19.2 FFI string ownership
+### 19.2 String list (optional)
+`resolver_find_matches` returns a `ResolverStringList` containing zero or more OS paths that
+case-insensitively match the leaf component of `input_path`. It resolves the parent path using
+the same rules as normal resolution (base_dir confinement, `..` handling, symlink boundaries,
+root mapping on Linux). Collisions are not errors for this API; they are represented as multiple
+entries in the list. If no matches exist, the call returns `OK` with an empty list.
+
+The returned list MUST be freed by the caller with `resolver_free_string_list`.
+
+Recommended types:
+- `ResolverStringList`: `{ size, entries, count }`
+  - `entries` is a `ResolverBufferView` pointing to an array of `ResolverStringView` of length `count`.
+- `resolver_free_string_list(list)` releases both the array and each contained string.
+
+### 19.3 FFI string ownership
 If `resolver_execute_open_return_path` returns a non-empty path via `ResolverResolvedPath`, the implementation MAY allocate the buffer. In that case:
 - The caller MUST release the buffer with `resolver_free_string`.
 - The buffer remains valid across subsequent resolver calls and after `resolver_destroy` (it is standalone heap memory).

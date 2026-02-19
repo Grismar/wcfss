@@ -187,6 +187,15 @@ pub struct ResolverResolvedPath {
     pub value: ResolverStringView,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ResolverStringList {
+    pub size: u32,
+    pub entries: ResolverBufferView,
+    pub count: usize,
+    pub reserved: [u64; 4],
+}
+
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ResolverLogLevel {

@@ -245,6 +245,15 @@ class ResolverResolvedPath(ctypes.Structure):
     _fields_ = [("value", ResolverStringView)]
 
 
+class ResolverStringList(ctypes.Structure):
+    _fields_ = [
+        ("size", ctypes.c_uint32),
+        ("entries", ResolverBufferView),
+        ("count", ctypes.c_size_t),
+        ("reserved", ctypes.c_uint64 * 4),
+    ]
+
+
 def _load_library(path: Optional[str] = None) -> ctypes.CDLL:
     if path:
         return ctypes.CDLL(path)
@@ -422,6 +431,16 @@ def _string_from_view(view: ResolverStringView, lib: ctypes.CDLL) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _strings_from_list(list_view: ResolverStringList, lib: ctypes.CDLL) -> List[str]:
+    if not list_view.entries.ptr or list_view.count == 0:
+        return []
+    array_type = ResolverStringView * list_view.count
+    array = ctypes.cast(list_view.entries.ptr, ctypes.POINTER(array_type)).contents
+    values = [ctypes.string_at(v.ptr, v.len).decode("utf-8", errors="replace") for v in array]
+    lib.resolver_free_string_list(list_view)
+    return values
+
+
 def _raise_for_status(status: Status, diag: Optional[List["DiagEntry"]] = None) -> None:
     if status == Status.OK:
         return
@@ -570,6 +589,15 @@ class Resolver:
         ]
         lib.resolver_execute_open_return_fd.restype = ctypes.c_int
 
+        lib.resolver_find_matches.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ResolverStringView),
+            ctypes.POINTER(ResolverStringView),
+            ctypes.POINTER(ResolverStringList),
+            ctypes.POINTER(ResolverDiag),
+        ]
+        lib.resolver_find_matches.restype = ctypes.c_int
+
         lib.resolver_execute_from_plan.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ResolverPlan),
@@ -583,6 +611,7 @@ class Resolver:
 
         lib.resolver_free_string.argtypes = [ResolverStringView]
         lib.resolver_free_buffer.argtypes = [ResolverBufferView]
+        lib.resolver_free_string_list.argtypes = [ResolverStringList]
 
     def close(self) -> None:
         if self._handle:
@@ -685,6 +714,26 @@ class Resolver:
         diags = _read_diag(diag, self._lib)
         _raise_for_status(status, diags)
         return fd.value
+
+    def find_matches(self, base_dir: str, input_path: str) -> List[str]:
+        """Find all case-insensitive matches for the leaf component."""
+        base_view = _as_view(base_dir)
+        input_view = _as_view(input_path)
+        out_list = ResolverStringList()
+        out_list.size = ctypes.sizeof(ResolverStringList)
+        out_list.entries = ResolverBufferView(None, 0)
+        out_list.count = 0
+        out_list.reserved = (ctypes.c_uint64 * 4)(*([0] * 4))
+        diag = ResolverDiag()
+        diag.size = ctypes.sizeof(ResolverDiag)
+        status = Status(self._lib.resolver_find_matches(self._handle,
+                                                        ctypes.byref(base_view),
+                                                        ctypes.byref(input_view),
+                                                        ctypes.byref(out_list),
+                                                        ctypes.byref(diag)))
+        diags = _read_diag(diag, self._lib)
+        _raise_for_status(status, diags)
+        return _strings_from_list(out_list, self._lib)
 
     def execute_mkdirs(self, base_dir: str, input_path: str) -> None:
         """Create directories according to Windows-compatible semantics."""

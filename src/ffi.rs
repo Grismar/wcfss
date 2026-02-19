@@ -88,6 +88,19 @@ fn validate_out_metrics(out_metrics: *mut ResolverMetrics) -> Result<(), Resolve
     Ok(())
 }
 
+fn validate_out_string_list(out_list: *mut ResolverStringList) -> Result<(), ResolverStatus> {
+    if out_list.is_null() {
+        return Err(ResolverStatus::InvalidPath);
+    }
+    unsafe {
+        let size = (*out_list).size;
+        if size != 0 && size < std::mem::size_of::<ResolverStringList>() as u32 {
+            return Err(ResolverStatus::InvalidPath);
+        }
+    }
+    Ok(())
+}
+
 fn status_invalid_handle() -> ResolverStatus {
     ResolverStatus::InvalidPath
 }
@@ -321,6 +334,27 @@ pub extern "C" fn resolver_execute_from_plan(
 }
 
 #[no_mangle]
+pub extern "C" fn resolver_find_matches(
+    handle: *mut ResolverHandle,
+    base_dir: *const ResolverStringView,
+    input_path: *const ResolverStringView,
+    out_list: *mut ResolverStringList,
+    out_diag: *mut ResolverDiag,
+) -> ResolverStatus {
+    if let Err(status) = validate_out_string_list(out_list) {
+        return status;
+    }
+    if let Err(status) = validate_out_diag(out_diag) {
+        return status;
+    }
+    let handle = unsafe { handle.as_ref() };
+    match handle {
+        Some(h) => h.inner.find_matches(base_dir, input_path, out_list, out_diag),
+        None => status_invalid_handle(),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn resolver_get_metrics(
     handle: *mut ResolverHandle,
     out_metrics: *mut ResolverMetrics,
@@ -352,5 +386,20 @@ pub extern "C" fn resolver_free_buffer(value: ResolverBufferView) {
     }
     unsafe {
         libc::free(value.ptr as *mut libc::c_void);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn resolver_free_string_list(value: ResolverStringList) {
+    if value.entries.ptr.is_null() {
+        return;
+    }
+    let count = value.count;
+    unsafe {
+        let views = std::slice::from_raw_parts(value.entries.ptr as *const ResolverStringView, count);
+        for view in views {
+            resolver_free_string(*view);
+        }
+        resolver_free_buffer(value.entries);
     }
 }

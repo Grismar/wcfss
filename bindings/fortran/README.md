@@ -27,10 +27,12 @@ use wcfss
 type(c_ptr) :: h
 type(ResolverResult) :: res
 character(len=:), allocatable :: resolved
+character(len=:), allocatable :: resolved_list(:)
 
 h = wcfss_create()
 call wcfss_execute_open_return_path(h, "/tmp", "file.txt", INTENT_READ, resolved)
 open(unit=10, file=resolved, status="old", action="read")
+call wcfss_find_matches(h, "/tmp", "FILE.TXT", resolved_list)
 call wcfss_destroy(h)
 ```
 

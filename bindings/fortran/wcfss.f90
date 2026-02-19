@@ -149,6 +149,13 @@ module wcfss
      type(ResolverStringView) :: value
   end type ResolverResolvedPath
 
+  type, bind(C), public :: ResolverStringList
+     integer(c_uint32_t) :: size
+     type(ResolverBufferView) :: entries
+     integer(c_size_t) :: count
+     integer(c_uint64_t) :: reserved(4)
+  end type ResolverStringList
+
   ! Public Fortran API
   public :: wcfss_create
   public :: wcfss_destroy
@@ -163,6 +170,8 @@ module wcfss
   public :: wcfss_set_root_mapping
   public :: wcfss_plan_destroy
   public :: wcfss_diag_destroy
+  public :: wcfss_find_matches
+  public :: wcfss_string_list_destroy
   public :: wcfss_log_set_stderr
   public :: wcfss_log_set_level
   public :: wcfss_log_disable
@@ -232,6 +241,22 @@ module wcfss
        type(c_ptr), value :: out_result
        type(c_ptr), value :: out_diag
      end function resolver_execute_unlink
+
+     function resolver_find_matches(handle, base_dir, input_path, out_list, out_diag) &
+         bind(C, name="resolver_find_matches")
+       import :: c_ptr, c_int
+       integer(c_int) :: resolver_find_matches
+       type(c_ptr), value :: handle
+       type(c_ptr), value :: base_dir
+       type(c_ptr), value :: input_path
+       type(c_ptr), value :: out_list
+       type(c_ptr), value :: out_diag
+     end function resolver_find_matches
+
+     subroutine resolver_free_string_list(value) bind(C, name="resolver_free_string_list")
+       import :: ResolverStringList
+       type(ResolverStringList), value :: value
+     end subroutine resolver_free_string_list
 
      function resolver_log_set_stderr(level) bind(C, name="resolver_log_set_stderr")
        import :: c_int
@@ -358,6 +383,33 @@ contains
     end do
   end subroutine view_to_string
 
+  subroutine string_list_to_array(list, out_arr)
+    type(ResolverStringList), intent(in) :: list
+    character(len=:), allocatable, intent(out) :: out_arr(:)
+    type(ResolverStringView), pointer :: views(:)
+    integer :: i, count, max_len
+    character(len=:), allocatable :: tmp
+    count = int(list%count)
+    if (count <= 0 .or. .not. c_associated(list%entries%ptr)) then
+      allocate(character(len=0) :: out_arr(0))
+      return
+    end if
+    call c_f_pointer(list%entries%ptr, views, [count])
+    max_len = 0
+    do i = 1, count
+      if (int(views(i)%len) > max_len) max_len = int(views(i)%len)
+    end do
+    if (max_len <= 0) then
+      allocate(character(len=0) :: out_arr(count))
+      return
+    end if
+    allocate(character(len=max_len) :: out_arr(count))
+    do i = 1, count
+      call view_to_string(views(i), tmp)
+      out_arr(i) = tmp
+    end do
+  end subroutine string_list_to_array
+
   function wcfss_create(config) result(handle)
     type(ResolverConfig), intent(in), optional :: config
     type(c_ptr) :: handle
@@ -428,6 +480,50 @@ contains
     diag%entries%ptr = c_null_ptr
     diag%entries%len = 0_c_size_t
   end subroutine wcfss_diag_destroy
+
+  function wcfss_find_matches(handle, base_dir, input_path, matches, diag) result(status)
+    type(c_ptr), intent(in) :: handle
+    character(len=*), intent(in) :: base_dir
+    character(len=*), intent(in) :: input_path
+    character(len=:), allocatable, intent(out) :: matches(:)
+    type(ResolverDiag), intent(inout), optional :: diag
+    integer(c_int) :: status
+    type(ResolverStringView), target :: base_view, input_view
+    character(kind=c_char), allocatable, target :: base_buf(:), input_buf(:)
+    type(ResolverStringList), target :: list
+    type(ResolverDiag), target :: local_diag
+    type(c_ptr) :: diag_ptr
+
+    list%size = int(c_sizeof(list), c_uint32_t)
+    list%entries%ptr = c_null_ptr
+    list%entries%len = 0_c_size_t
+    list%count = 0_c_size_t
+    list%reserved = 0_c_uint64_t
+
+    call make_view(base_dir, base_view, base_buf)
+    call make_view(input_path, input_view, input_buf)
+
+    if (present(diag)) then
+      diag%size = int(c_sizeof(diag), c_uint32_t)
+      diag_ptr = c_loc(diag)
+    else
+      local_diag%size = 0_c_uint32_t
+      diag_ptr = c_null_ptr
+    end if
+
+    status = resolver_find_matches(handle, c_loc(base_view), c_loc(input_view), c_loc(list), diag_ptr)
+    if (status == RESOLVER_OK) then
+      call string_list_to_array(list, matches)
+    else
+      allocate(character(len=0) :: matches(0))
+    end if
+    call resolver_free_string_list(list)
+  end function wcfss_find_matches
+
+  subroutine wcfss_string_list_destroy(list)
+    type(ResolverStringList), intent(in) :: list
+    call resolver_free_string_list(list)
+  end subroutine wcfss_string_list_destroy
 
   function wcfss_log_set_stderr(level) result(status)
     integer(c_int), intent(in) :: level

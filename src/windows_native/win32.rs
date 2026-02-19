@@ -159,6 +159,42 @@ pub fn find_match(dir: &Path, target: &OsStr) -> Result<MatchResult, ResolverSta
     Ok(result)
 }
 
+pub fn find_all_matches(dir: &Path, target: &OsStr) -> Result<Vec<OsString>, ResolverStatus> {
+    let mut pattern = PathBuf::from(dir);
+    pattern.push("*");
+    let pattern_wide = os_str_to_wide(pattern.as_os_str());
+
+    let mut find_data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let handle = unsafe { FindFirstFileW(pattern_wide.as_ptr(), &mut find_data) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(map_win32_error(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
+    }
+
+    let target_wide: Vec<u16> = target.encode_wide().collect();
+    let mut matches: Vec<OsString> = Vec::new();
+
+    let mut keep_going = true;
+    while keep_going {
+        let name_slice = wide_slice_from_find_data(&find_data.cFileName);
+        if name_slice != [b'.' as u16] && name_slice != [b'.' as u16, b'.' as u16] {
+            if compare_ordinal(name_slice, &target_wide, true) {
+                matches.push(OsString::from_wide(name_slice));
+            }
+        }
+        keep_going = unsafe { FindNextFileW(handle, &mut find_data) } != 0;
+    }
+
+    unsafe {
+        FindClose(handle);
+    }
+
+    matches.sort_by_key(|value| value.to_string_lossy().to_lowercase());
+    matches.dedup_by_key(|value| value.to_string_lossy().to_lowercase());
+    Ok(matches)
+}
+
 pub fn create_directory(path: &Path) -> Result<(), ResolverStatus> {
     let wide = os_str_to_wide(path.as_os_str());
     let ok = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };

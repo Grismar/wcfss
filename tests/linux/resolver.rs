@@ -125,6 +125,47 @@ fn open_return_fd(
     Ok(fd)
 }
 
+fn find_matches(
+    resolver: &TestResolver,
+    base_dir: &str,
+    input_path: &str,
+) -> Result<Vec<String>, ResolverStatus> {
+    let (_base_buf, base_view) = make_view(base_dir);
+    let (_input_buf, input_view) = make_view(input_path);
+    let mut list = ResolverStringList {
+        size: std::mem::size_of::<ResolverStringList>() as u32,
+        entries: ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        count: 0,
+        reserved: [0; 4],
+    };
+    let status = resolver_find_matches(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        &mut list,
+        std::ptr::null_mut(),
+    );
+    if status != ResolverStatus::Ok {
+        return Err(status);
+    }
+    if list.entries.ptr.is_null() || list.count == 0 {
+        return Ok(Vec::new());
+    }
+    let views = unsafe {
+        std::slice::from_raw_parts(list.entries.ptr as *const ResolverStringView, list.count)
+    };
+    let mut out = Vec::with_capacity(views.len());
+    for view in views {
+        let bytes = unsafe { std::slice::from_raw_parts(view.ptr as *const u8, view.len) };
+        out.push(String::from_utf8_lossy(bytes).into_owned());
+    }
+    resolver_free_string_list(list);
+    Ok(out)
+}
+
 fn execute_mkdirs(
     resolver: &TestResolver,
     base_dir: &str,
@@ -857,4 +898,23 @@ fn plan_token_dir_generation_stale_after_mutation() {
     resolver_free_string(plan_before.resolved_leaf);
     resolver_free_string(plan_after.resolved_parent);
     resolver_free_string(plan_after.resolved_leaf);
+}
+
+#[test]
+fn find_matches_returns_all_collisions() {
+    let tmp = TempDir::new("find_matches");
+    let resolver = TestResolver::new(0);
+    let base = tmp.path.to_string_lossy().into_owned();
+
+    let dir = tmp.path.join("DATA");
+    fs::create_dir_all(&dir).expect("create dir");
+    let path_a = dir.join("File.txt");
+    let path_b = dir.join("file.txt");
+    fs::write(&path_a, "a").expect("write file");
+    fs::write(&path_b, "b").expect("write file");
+
+    let matches = find_matches(&resolver, &base, "DATA/FILE.TXT").expect("find matches");
+    assert_eq!(matches.len(), 2);
+    assert!(matches.iter().any(|p| p.ends_with("DATA/File.txt")));
+    assert!(matches.iter().any(|p| p.ends_with("DATA/file.txt")));
 }

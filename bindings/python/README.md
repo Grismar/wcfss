@@ -38,6 +38,8 @@ with Resolver(ResolverConfig()) as r:
     resolved = r.execute_open_return_path("/tmp", "file.txt", Intent.READ)
     with open(resolved, "rb") as f:
         data = f.read()
+    matches = r.find_matches("/tmp", "FILE.TXT")
+    print(matches)
 ```
 
 ## Error Handling

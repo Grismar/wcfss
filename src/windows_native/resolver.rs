@@ -745,6 +745,45 @@ fn write_string_view(value: &str, out: &mut ResolverStringView) -> Result<(), Re
     Ok(())
 }
 
+fn write_string_list(values: &[String], out: &mut ResolverStringList) -> Result<(), ResolverStatus> {
+    out.size = std::mem::size_of::<ResolverStringList>() as u32;
+    out.count = values.len();
+    out.entries = ResolverBufferView {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    if values.is_empty() {
+        return Ok(());
+    }
+    let count = values.len();
+    let bytes = count * std::mem::size_of::<ResolverStringView>();
+    let ptr = unsafe { libc::malloc(bytes) } as *mut ResolverStringView;
+    if ptr.is_null() {
+        return Err(ResolverStatus::IoError);
+    }
+    let views = unsafe { std::slice::from_raw_parts_mut(ptr, count) };
+    for view in views.iter_mut() {
+        view.ptr = std::ptr::null();
+        view.len = 0;
+    }
+    for (idx, value) in values.iter().enumerate() {
+        if write_string_view(value, &mut views[idx]).is_err() {
+            for view in views.iter() {
+                if !view.ptr.is_null() {
+                    unsafe { libc::free(view.ptr as *mut libc::c_void) };
+                }
+            }
+            unsafe { libc::free(ptr as *mut libc::c_void) };
+            return Err(ResolverStatus::IoError);
+        }
+    }
+    out.entries = ResolverBufferView {
+        ptr: ptr as *const core::ffi::c_void,
+        len: count,
+    };
+    Ok(())
+}
+
 fn set_plan_paths(plan: &mut ResolverPlan, resolved: &Path) -> Result<(), ResolverStatus> {
     let parent = resolved.parent().unwrap_or(resolved);
     let parent_str = parent.to_string_lossy();
@@ -1704,6 +1743,92 @@ impl Resolver for WindowsResolver {
         }
         write_diag_entries(_out_diag, &diag);
         status
+    }
+
+    fn find_matches(
+        &self,
+        base_dir: *const ResolverStringView,
+        input_path: *const ResolverStringView,
+        out_list: *mut ResolverStringList,
+        out_diag: *mut ResolverDiag,
+    ) -> ResolverStatus {
+        let out_list = unsafe { out_list.as_mut() };
+        let out_list = match out_list {
+            Some(out) => out,
+            None => return ResolverStatus::InvalidPath,
+        };
+        out_list.size = std::mem::size_of::<ResolverStringList>() as u32;
+        out_list.entries = ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        out_list.count = 0;
+        out_list.reserved = [0; 4];
+
+        let input_path = match string_view_to_string(input_path) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let base_dir = match base_dir_from_view(base_dir) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+
+        let mut diag = DiagCollector::default();
+        if input_path.contains('/') {
+            diag.push(
+                ResolverDiagCode::BackslashNormalized,
+                ResolverDiagSeverity::Warning,
+                input_path.clone(),
+                "input contained forward slashes".to_string(),
+            );
+        }
+        if let Err(status) = validate_base_dir(&base_dir) {
+            write_diag_entries(out_diag, &diag);
+            return status;
+        }
+
+        let (parent, leaf) = match resolve_parent_and_leaf(self, &base_dir, &input_path, Some(&mut diag)) {
+            Ok(value) => value,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
+        };
+
+        let matches = match win32::find_all_matches(&parent, &leaf) {
+            Ok(value) => value,
+            Err(status) => {
+                write_diag_entries(out_diag, &diag);
+                return status;
+            }
+        };
+
+        if matches.len() > 1 {
+            let detail = matches
+                .iter()
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect::<Vec<String>>()
+                .join(", ");
+            diag.push(
+                ResolverDiagCode::Collision,
+                ResolverDiagSeverity::Warning,
+                parent.display().to_string(),
+                detail,
+            );
+        }
+
+        let mut paths = Vec::with_capacity(matches.len());
+        for name in matches {
+            paths.push(parent.join(name).to_string_lossy().into_owned());
+        }
+
+        if let Err(status) = write_string_list(&paths, out_list) {
+            write_diag_entries(out_diag, &diag);
+            return status;
+        }
+        write_diag_entries(out_diag, &diag);
+        ResolverStatus::Ok
     }
 
     fn get_metrics(&self, _out_metrics: *mut ResolverMetrics) -> ResolverStatus {

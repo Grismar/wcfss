@@ -66,5 +66,13 @@ pub trait Resolver: Send + Sync {
         out_diag: *mut ResolverDiag,
     ) -> ResolverStatus;
 
+    fn find_matches(
+        &self,
+        base_dir: *const ResolverStringView,
+        input_path: *const ResolverStringView,
+        out_list: *mut ResolverStringList,
+        out_diag: *mut ResolverDiag,
+    ) -> ResolverStatus;
+
     fn get_metrics(&self, out_metrics: *mut ResolverMetrics) -> ResolverStatus;
 }

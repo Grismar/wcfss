@@ -19,6 +19,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolver = Resolver::new(None)?;
     let plan = resolver.plan("/tmp", "file.txt", Intent::StatExists)?;
     resolver.execute_from_plan(&plan)?;
+    let matches = resolver.find_matches("/tmp", "FILE.TXT")?;
+    println!("matches: {matches:?}");
     Ok(())
 }
 ```

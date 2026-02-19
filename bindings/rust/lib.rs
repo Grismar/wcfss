@@ -211,6 +211,15 @@ pub struct ResolverResolvedPath {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct ResolverStringList {
+    pub size: u32,
+    pub entries: ResolverBufferView,
+    pub count: usize,
+    pub reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct ResolverLogRecord {
     pub level: LogLevel,
     pub target: ResolverStringView,
@@ -232,6 +241,13 @@ extern "C" {
     fn resolver_log_set_callback(callback: LogCallback, user_data: *mut c_void, level: LogLevel) -> Status;
     fn resolver_log_set_level(level: LogLevel) -> Status;
     fn resolver_log_disable() -> Status;
+    fn resolver_find_matches(
+        handle: *mut ResolverHandle,
+        base_dir: *const ResolverStringView,
+        input_path: *const ResolverStringView,
+        out_list: *mut ResolverStringList,
+        out_diag: *mut ResolverDiag,
+    ) -> Status;
     fn resolver_create(config: *const ResolverConfig) -> *mut ResolverHandle;
     fn resolver_destroy(handle: *mut ResolverHandle);
     fn resolver_set_root_mapping(
@@ -294,6 +310,7 @@ extern "C" {
     fn resolver_get_metrics(handle: *mut ResolverHandle, out_metrics: *mut ResolverMetrics) -> Status;
     fn resolver_free_string(value: ResolverStringView);
     fn resolver_free_buffer(value: ResolverBufferView);
+    fn resolver_free_string_list(value: ResolverStringList);
 }
 
 pub fn enable_stderr_logging(level: LogLevel) -> Result<()> {
@@ -469,6 +486,45 @@ impl Resolver {
             resolver_execute_from_plan(self.handle, &plan.plan, &mut result, ptr::null_mut())
         };
         map_status(status)
+    }
+
+    pub fn find_matches(&self, base_dir: &str, input_path: &str) -> Result<Vec<String>> {
+        let base_c = cstring(base_dir)?;
+        let input_c = cstring(input_path)?;
+        let mut list = ResolverStringList {
+            size: std::mem::size_of::<ResolverStringList>() as u32,
+            entries: ResolverBufferView {
+                ptr: ptr::null(),
+                len: 0,
+            },
+            count: 0,
+            reserved: [0; 4],
+        };
+        let status = unsafe {
+            resolver_find_matches(
+                self.handle,
+                &view_from_cstring(&base_c),
+                &view_from_cstring(&input_c),
+                &mut list,
+                ptr::null_mut(),
+            )
+        };
+        map_status(status)?;
+        if list.entries.ptr.is_null() || list.count == 0 {
+            return Ok(Vec::new());
+        }
+        let views = unsafe {
+            std::slice::from_raw_parts(list.entries.ptr as *const ResolverStringView, list.count)
+        };
+        let mut out = Vec::with_capacity(views.len());
+        for view in views {
+            let bytes = unsafe { std::slice::from_raw_parts(view.ptr as *const u8, view.len) };
+            out.push(String::from_utf8_lossy(bytes).into_owned());
+        }
+        unsafe {
+            resolver_free_string_list(list);
+        }
+        Ok(out)
     }
 
     pub fn execute_open_return_path(

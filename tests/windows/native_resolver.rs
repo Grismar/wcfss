@@ -139,6 +139,47 @@ fn open_return_fd(
     Ok(fd)
 }
 
+fn find_matches(
+    resolver: &TestResolver,
+    base_dir: &str,
+    input_path: &str,
+) -> Result<Vec<String>, ResolverStatus> {
+    let (_base_buf, base_view) = make_view(base_dir);
+    let (_input_buf, input_view) = make_view(input_path);
+    let mut list = ResolverStringList {
+        size: std::mem::size_of::<ResolverStringList>() as u32,
+        entries: ResolverBufferView {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        count: 0,
+        reserved: [0; 4],
+    };
+    let status = resolver_find_matches(
+        resolver.handle,
+        &base_view,
+        &input_view,
+        &mut list,
+        std::ptr::null_mut(),
+    );
+    if status != ResolverStatus::Ok {
+        return Err(status);
+    }
+    if list.entries.ptr.is_null() || list.count == 0 {
+        return Ok(Vec::new());
+    }
+    let views = unsafe {
+        std::slice::from_raw_parts(list.entries.ptr as *const ResolverStringView, list.count)
+    };
+    let mut out = Vec::with_capacity(views.len());
+    for view in views {
+        let bytes = unsafe { std::slice::from_raw_parts(view.ptr as *const u8, view.len) };
+        out.push(String::from_utf8_lossy(bytes).into_owned());
+    }
+    resolver_free_string_list(list);
+    Ok(out)
+}
+
 fn execute_mkdirs(
     resolver: &TestResolver,
     base_dir: &str,
@@ -683,4 +724,22 @@ fn cache_invalidation_after_unlink() {
         .err()
         .unwrap_or(ResolverStatus::Ok);
     assert_eq!(status, ResolverStatus::NotFound);
+}
+
+#[test]
+fn find_matches_single_and_missing() {
+    let temp = TempDir::new("find_matches");
+    let resolver = TestResolver::new();
+    let base = temp.path.to_string_lossy().into_owned();
+
+    let dir = temp.path.join("DATA");
+    fs::create_dir_all(&dir).expect("create dir");
+    fs::write(dir.join("File.txt"), "a").expect("write file");
+
+    let matches = find_matches(&resolver, &base, "DATA/FILE.TXT").expect("find matches");
+    assert_eq!(matches.len(), 1);
+    assert!(matches[0].ends_with("DATA\\File.txt") || matches[0].ends_with("DATA/File.txt"));
+
+    let missing = find_matches(&resolver, &base, "DATA/MISSING.TXT").expect("find matches");
+    assert_eq!(missing.len(), 0);
 }
