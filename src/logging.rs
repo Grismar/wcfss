@@ -180,6 +180,7 @@ pub fn log_set_stderr(level: ResolverLogLevel) -> ResolverStatus {
 
 pub fn log_set_callback(callback: ResolverLogCallback, user_data: *mut c_void, level: ResolverLogLevel) -> ResolverStatus {
     if callback.is_none() {
+        LOGGER.set_callback(None, core::ptr::null_mut());
         return log_disable();
     }
     if matches!(init_logger(), LoggerInstall::External) {
@@ -207,6 +208,7 @@ pub fn log_set_level(level: ResolverLogLevel) -> ResolverStatus {
 pub fn log_disable() -> ResolverStatus {
     match init_logger() {
         LoggerInstall::Installed => {
+            LOGGER.set_callback(None, core::ptr::null_mut());
             LOGGER.set_mode(MODE_DISABLED);
             LOGGER.set_level(ResolverLogLevel::Off);
             ResolverStatus::Ok

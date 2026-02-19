@@ -6,3 +6,6 @@ mod parser {
 mod resolver {
     include!("linux/resolver.rs");
 }
+mod logging {
+    include!("linux/logging.rs");
+}
