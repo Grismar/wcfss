@@ -17,6 +17,10 @@ const MAX_INPUT_PATH_BYTES: usize = 32 * 1024;
 const MAX_COMPONENTS: usize = 4096;
 const MAX_COMPONENT_BYTES: usize = 255;
 
+fn trace(msg: &str) {
+    log::trace!(target: "wcfss::windows", "{msg}");
+}
+
 pub struct WindowsResolver {
     _private: (),
     metrics: MetricsCounters,
@@ -419,6 +423,13 @@ fn resolve_path_for_intent(
 ) -> Result<PathBuf, ResolverStatus> {
     let normalized_input = input_path.replace('/', "\\");
     let absolute_input = Path::new(&normalized_input).is_absolute();
+    if normalized_input.as_str() != input_path {
+        trace("Input contained forward slashes; normalized to backslashes.");
+    }
+    trace(&format!(
+        "resolve_path_for_intent base='{}' input='{}' intent={:?}",
+        base_dir, input_path, intent
+    ));
     let (start, components) = resolve_base_and_components(base_dir, input_path)?;
     let result = (|| {
         if components.is_empty() {
@@ -433,6 +444,7 @@ fn resolve_path_for_intent(
         for (idx, component) in components.iter().enumerate() {
             match component {
                 ParsedComponent::Parent => {
+                    trace(&format!("Encountered .. in {}", current.display()));
                     if stack.len() <= 1 {
                         return Err(ResolverStatus::EscapesRoot);
                     }
@@ -451,6 +463,11 @@ fn resolve_path_for_intent(
                     current = stack.last().unwrap().0.clone();
                 }
                 ParsedComponent::Normal(name) => {
+                    trace(&format!(
+                        "Resolving component '{}' in {}",
+                        name.to_string_lossy(),
+                        current.display()
+                    ));
                     let is_last = idx + 1 == components.len();
                     if is_last {
                         let leaf_name = resolve_final(
@@ -483,10 +500,12 @@ fn resolve_path_for_intent(
                         }
                     };
                     if match_result.count == 0 {
+                        trace("Component not found.");
                         return Err(ResolverStatus::NotFound);
                     }
                     if match_result.count > 1 {
                         resolver.metrics.collisions.fetch_add(1, Ordering::SeqCst);
+                        trace("Component collision detected.");
                         if let Some(diag) = diag.as_deref_mut() {
                             diag.push(
                                 ResolverDiagCode::Collision,
@@ -499,9 +518,13 @@ fn resolve_path_for_intent(
                     }
                     let actual = match_result.unique_name.unwrap_or_else(|| name.clone());
                     if (match_result.unique_attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+                        trace("Intermediate component is not a directory.");
                         return Err(ResolverStatus::NotADirectory);
                     }
                     let next_path = win32::join_path(&current, &actual);
+                    if is_symlink_attr(match_result.unique_attrs) {
+                        trace(&format!("Encountered symlink: {}", next_path.display()));
+                    }
                     stack.push((next_path.clone(), is_symlink_attr(match_result.unique_attrs)));
                     current = next_path;
                 }
