@@ -55,3 +55,27 @@ try:
 except ResolverError as exc:
     print("Resolver failed:", exc)
 ```
+
+## Logging
+
+By default, the core library is quiet. To connect Rust logs to Python's `logging`
+module, call `init_logging` explicitly:
+
+```python
+import logging
+from wcfss import init_logging, LogLevel
+
+logging.basicConfig(level=logging.INFO)
+init_logging(level=LogLevel.INFO, logger_name="wcfss")
+```
+
+Notes:
+- Logging callbacks can be invoked from non-Python threads. The binding acquires the GIL
+  automatically, but you should keep handlers thread-safe (the standard `logging` module is).
+
+If you just want stderr output (opt-in), use:
+
+```python
+from wcfss import enable_stderr_logging
+enable_stderr_logging("DEBUG")
+```

@@ -42,3 +42,22 @@ match Resolver::new(None) {
 ## Ownership Rules
 
 `Resolver` and `Plan` free C-allocated buffers automatically via `Drop`.
+
+## Logging
+
+The core library is quiet by default. You can opt in to stderr logging:
+
+```rust
+use wcfss_bindings::{enable_stderr_logging, LogLevel};
+
+enable_stderr_logging(LogLevel::Info)?;
+```
+
+Or adjust the level / disable:
+
+```rust
+use wcfss_bindings::{set_log_level, disable_logging, LogLevel};
+
+set_log_level(LogLevel::Debug)?;
+disable_logging()?;
+```

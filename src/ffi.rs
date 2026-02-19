@@ -1,6 +1,8 @@
 use crate::common::types::*;
+use crate::logging;
 use crate::resolver::Resolver;
 use crate::PlatformResolver;
+use core::ffi::c_void;
 
 #[repr(C)]
 pub struct ResolverHandle {
@@ -107,6 +109,30 @@ pub extern "C" fn resolver_destroy(handle: *mut ResolverHandle) {
     unsafe {
         drop(Box::from_raw(handle));
     }
+}
+
+#[no_mangle]
+pub extern "C" fn resolver_log_set_stderr(level: ResolverLogLevel) -> ResolverStatus {
+    logging::log_set_stderr(level)
+}
+
+#[no_mangle]
+pub extern "C" fn resolver_log_set_callback(
+    callback: logging::ResolverLogCallback,
+    user_data: *mut c_void,
+    level: ResolverLogLevel,
+) -> ResolverStatus {
+    logging::log_set_callback(callback, user_data, level)
+}
+
+#[no_mangle]
+pub extern "C" fn resolver_log_set_level(level: ResolverLogLevel) -> ResolverStatus {
+    logging::log_set_level(level)
+}
+
+#[no_mangle]
+pub extern "C" fn resolver_log_disable() -> ResolverStatus {
+    logging::log_disable()
 }
 
 #[no_mangle]

@@ -54,6 +54,23 @@ If a wrapper returns allocated buffers (e.g., plans or resolved paths), use:
 
 These wrappers call `resolver_free_*` as required by the C ABI.
 
+## Logging
+
+Logging is quiet by default. You can enable stderr logging explicitly:
+
+```fortran
+use wcfss
+integer(c_int) :: status
+status = wcfss_log_set_stderr(RESOLVER_LOG_INFO)
+```
+
+You can adjust the level or disable logging later:
+
+```fortran
+status = wcfss_log_set_level(RESOLVER_LOG_DEBUG)
+status = wcfss_log_disable()
+```
+
 ## Notes on ifx Compatibility
 
 The module is standard Fortran 2003 with `ISO_C_BINDING`, so no code changes

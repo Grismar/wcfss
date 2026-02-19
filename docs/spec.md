@@ -474,7 +474,23 @@ The resolver MUST provide structured diagnostics including:
 - symlink loop/depth exceeded
 - permission denied (when surfaced)
 
-### 17.2 Metrics (mandatory baseline counters)
+### 17.2 Logging (optional, opt-in)
+The core library MUST NOT emit logs to stderr/stdout by default. Logging is opt-in and must be explicitly enabled by the host application or binding.
+
+Requirements:
+- The core emits logs via a logging facade (Rust `log` or `tracing`) and does not install a global subscriber/logger automatically.
+- Default behavior is quiet unless the host installs a logger/subscriber or calls explicit logging API functions.
+- Logging initialization MUST be idempotent and thread-safe.
+
+C ABI logging controls (optional but recommended for bindings):
+- `resolver_log_set_stderr(level) -> status`
+- `resolver_log_set_callback(callback, user_data, level) -> status`
+- `resolver_log_set_level(level) -> status`
+- `resolver_log_disable() -> status`
+
+Bindings SHOULD expose these controls in platform-idiomatic ways (e.g., Python `logging` integration, Fortran explicit stderr enable).
+
+### 17.3 Metrics (mandatory baseline counters)
 Expose counters (queryable via API):
 - DirIndex cache hits
 - DirIndex cache misses
@@ -513,6 +529,10 @@ Minimum:
 Optional:
 - `resolver_execute_open_return_fd(handle, base_dir, input_path, intent, out_fd, out_diag) -> status`
 - `resolver_execute_from_plan(handle, plan, out_result, out_diag) -> status`
+- `resolver_log_set_stderr(level) -> status`
+- `resolver_log_set_callback(callback, user_data, level) -> status`
+- `resolver_log_set_level(level) -> status`
+- `resolver_log_disable() -> status`
 
 Status codes MUST distinguish at least:
 - OK
@@ -532,7 +552,13 @@ Status codes MUST distinguish at least:
 - IO_ERROR
 - INVALID_PATH
 
-### 19.1 FFI string ownership
+### 19.1 Logging types (optional)
+If logging callbacks are exposed via the C ABI, the recommended types are:
+- `ResolverLogLevel` (int32): `OFF=0`, `ERROR=1`, `WARN=2`, `INFO=3`, `DEBUG=4`, `TRACE=5`.
+- `ResolverLogRecord`: `{ level, target, message, file, line }` where all strings are `ResolverStringView`.
+- Callback signature: `void (*)(const ResolverLogRecord *record, void *user_data)`.
+
+### 19.2 FFI string ownership
 If `resolver_execute_open_return_path` returns a non-empty path via `ResolverResolvedPath`, the implementation MAY allocate the buffer. In that case:
 - The caller MUST release the buffer with `resolver_free_string`.
 - The buffer remains valid across subsequent resolver calls and after `resolver_destroy` (it is standalone heap memory).

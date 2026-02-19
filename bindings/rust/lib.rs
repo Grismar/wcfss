@@ -54,6 +54,17 @@ pub enum Intent {
     Rename = 6,
 }
 
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum LogLevel {
+    Off = 0,
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Trace = 5,
+}
+
 pub const RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY: u32 = 1 << 0;
 pub const RESOLVER_FLAG_ENABLE_WINDOWS_ABSOLUTE_PATHS: u32 = 1 << 1;
 
@@ -199,12 +210,28 @@ pub struct ResolverResolvedPath {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ResolverLogRecord {
+    pub level: LogLevel,
+    pub target: ResolverStringView,
+    pub message: ResolverStringView,
+    pub file: ResolverStringView,
+    pub line: u32,
+}
+
+pub type LogCallback = Option<extern "C" fn(record: *const ResolverLogRecord, user_data: *mut c_void)>;
+
+#[repr(C)]
 pub struct ResolverHandle {
     _private: [u8; 0],
 }
 
 #[link(name = "wcfss")]
 extern "C" {
+    fn resolver_log_set_stderr(level: LogLevel) -> Status;
+    fn resolver_log_set_callback(callback: LogCallback, user_data: *mut c_void, level: LogLevel) -> Status;
+    fn resolver_log_set_level(level: LogLevel) -> Status;
+    fn resolver_log_disable() -> Status;
     fn resolver_create(config: *const ResolverConfig) -> *mut ResolverHandle;
     fn resolver_destroy(handle: *mut ResolverHandle);
     fn resolver_set_root_mapping(
@@ -267,6 +294,42 @@ extern "C" {
     fn resolver_get_metrics(handle: *mut ResolverHandle, out_metrics: *mut ResolverMetrics) -> Status;
     fn resolver_free_string(value: ResolverStringView);
     fn resolver_free_buffer(value: ResolverBufferView);
+}
+
+pub fn enable_stderr_logging(level: LogLevel) -> Result<()> {
+    let status = unsafe { resolver_log_set_stderr(level) };
+    if status == Status::Ok {
+        Ok(())
+    } else {
+        Err(Error::Status(status))
+    }
+}
+
+pub fn set_log_callback(callback: LogCallback, user_data: *mut c_void, level: LogLevel) -> Result<()> {
+    let status = unsafe { resolver_log_set_callback(callback, user_data, level) };
+    if status == Status::Ok {
+        Ok(())
+    } else {
+        Err(Error::Status(status))
+    }
+}
+
+pub fn set_log_level(level: LogLevel) -> Result<()> {
+    let status = unsafe { resolver_log_set_level(level) };
+    if status == Status::Ok {
+        Ok(())
+    } else {
+        Err(Error::Status(status))
+    }
+}
+
+pub fn disable_logging() -> Result<()> {
+    let status = unsafe { resolver_log_disable() };
+    if status == Status::Ok {
+        Ok(())
+    } else {
+        Err(Error::Status(status))
+    }
 }
 
 #[derive(Debug)]

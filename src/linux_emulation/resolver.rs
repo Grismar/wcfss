@@ -23,7 +23,7 @@ const SYMLINK_DEPTH_LIMIT: usize = 40;
 const DEFAULT_TTL_FAST_MS: u64 = 1000;
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 1000;
 fn trace(msg: &str) {
-    eprintln!("[wcfss][linux] {msg}");
+    log::trace!(target: "wcfss::linux", "{msg}");
 }
 
 #[derive(Debug)]

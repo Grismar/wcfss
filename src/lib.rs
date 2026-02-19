@@ -1,5 +1,6 @@
 mod common;
 mod ffi;
+mod logging;
 mod resolver;
 
 #[cfg(target_os = "windows")]

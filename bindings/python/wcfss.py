@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import logging
 import os
 from dataclasses import dataclass
 from enum import IntEnum
@@ -45,6 +46,15 @@ class Intent(IntEnum):
     CREATE_NEW = 4
     MKDIRS = 5
     RENAME = 6
+
+
+class LogLevel(IntEnum):
+    OFF = 0
+    ERROR = 1
+    WARN = 2
+    INFO = 3
+    DEBUG = 4
+    TRACE = 5
 
 
 RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY = 1 << 0
@@ -119,6 +129,16 @@ class ResolverStringView(ctypes.Structure):
 
 class ResolverBufferView(ctypes.Structure):
     _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+
+class ResolverLogRecord(ctypes.Structure):
+    _fields_ = [
+        ("level", ctypes.c_int),
+        ("target", ResolverStringView),
+        ("message", ResolverStringView),
+        ("file", ResolverStringView),
+        ("line", ctypes.c_uint32),
+    ]
 
 
 class ResolverConfig(ctypes.Structure):
@@ -241,6 +261,149 @@ def _load_library(path: Optional[str] = None) -> ctypes.CDLL:
                 continue
         raise OSError("Could not locate wcfss library. Set WCFSS_LIB to explicit path.")
     return ctypes.CDLL(name)
+
+
+_LOG_LIB: Optional[ctypes.CDLL] = None
+_LOG_BOUND = False
+_LOG_CALLBACK = None
+
+
+def _get_log_lib() -> ctypes.CDLL:
+    global _LOG_LIB
+    if _LOG_LIB is None:
+        _LOG_LIB = _load_library()
+    return _LOG_LIB
+
+
+def _bind_logging(lib: ctypes.CDLL) -> None:
+    global _LOG_BOUND
+    if _LOG_BOUND:
+        return
+    lib.resolver_log_set_stderr.argtypes = [ctypes.c_int]
+    lib.resolver_log_set_stderr.restype = ctypes.c_int
+    lib.resolver_log_set_callback.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    lib.resolver_log_set_callback.restype = ctypes.c_int
+    lib.resolver_log_set_level.argtypes = [ctypes.c_int]
+    lib.resolver_log_set_level.restype = ctypes.c_int
+    lib.resolver_log_disable.argtypes = []
+    lib.resolver_log_disable.restype = ctypes.c_int
+    _LOG_BOUND = True
+
+
+def _ensure_trace_level() -> None:
+    if logging.getLevelName(5) != "TRACE":
+        logging.addLevelName(5, "TRACE")
+
+
+def _sv_to_str(view: ResolverStringView) -> str:
+    if not view.ptr or not view.len:
+        return ""
+    return ctypes.string_at(view.ptr, view.len).decode("utf-8", errors="replace")
+
+
+def _parse_log_level(level) -> LogLevel:
+    if isinstance(level, LogLevel):
+        return level
+    if isinstance(level, str):
+        key = level.strip().upper()
+        mapping = {
+            "OFF": LogLevel.OFF,
+            "ERROR": LogLevel.ERROR,
+            "WARN": LogLevel.WARN,
+            "WARNING": LogLevel.WARN,
+            "INFO": LogLevel.INFO,
+            "DEBUG": LogLevel.DEBUG,
+            "TRACE": LogLevel.TRACE,
+        }
+        if key in mapping:
+            return mapping[key]
+        raise ValueError(f"unknown log level: {level}")
+    if isinstance(level, int):
+        if level <= 0:
+            return LogLevel.OFF
+        if level >= logging.ERROR:
+            return LogLevel.ERROR
+        if level >= logging.WARNING:
+            return LogLevel.WARN
+        if level >= logging.INFO:
+            return LogLevel.INFO
+        if level >= logging.DEBUG:
+            return LogLevel.DEBUG
+        return LogLevel.TRACE
+    raise TypeError("level must be str, int, or LogLevel")
+
+
+def _python_level_for_log(level: LogLevel) -> int:
+    if level == LogLevel.OFF:
+        return logging.NOTSET
+    if level == LogLevel.ERROR:
+        return logging.ERROR
+    if level == LogLevel.WARN:
+        return logging.WARNING
+    if level == LogLevel.INFO:
+        return logging.INFO
+    if level == LogLevel.DEBUG:
+        return logging.DEBUG
+    return 5
+
+
+def init_logging(level: "str | int | LogLevel" = "INFO", logger_name: str = "wcfss") -> None:
+    """Connect Rust logs to Python logging. Idempotent and thread-safe."""
+    _ensure_trace_level()
+    lib = _get_log_lib()
+    _bind_logging(lib)
+
+    parsed_level = _parse_log_level(level)
+    callback_type = ctypes.CFUNCTYPE(None, ctypes.POINTER(ResolverLogRecord), ctypes.c_void_p)
+    logger = logging.getLogger(logger_name)
+
+    def _callback(record_ptr, _user_data):
+        if not record_ptr:
+            return
+        rec = record_ptr.contents
+        try:
+            level_value = LogLevel(rec.level)
+        except ValueError:
+            level_value = LogLevel.INFO
+        msg = _sv_to_str(rec.message)
+        target = _sv_to_str(rec.target)
+        file = _sv_to_str(rec.file)
+        logger.log(
+            _python_level_for_log(level_value),
+            msg,
+            extra={"wcfss_target": target, "wcfss_file": file, "wcfss_line": rec.line},
+        )
+
+    global _LOG_CALLBACK
+    _LOG_CALLBACK = callback_type(_callback)
+    status = Status(lib.resolver_log_set_callback(_LOG_CALLBACK, None, int(parsed_level)))
+    _raise_for_status(status)
+
+
+def enable_stderr_logging(level: "str | int | LogLevel" = "INFO") -> None:
+    """Explicitly enable stderr logging from Rust. Idempotent."""
+    lib = _get_log_lib()
+    _bind_logging(lib)
+    parsed_level = _parse_log_level(level)
+    status = Status(lib.resolver_log_set_stderr(int(parsed_level)))
+    _raise_for_status(status)
+
+
+def set_log_level(level: "str | int | LogLevel") -> None:
+    """Adjust the log level without changing the output target."""
+    lib = _get_log_lib()
+    _bind_logging(lib)
+    parsed_level = _parse_log_level(level)
+    status = Status(lib.resolver_log_set_level(int(parsed_level)))
+    _raise_for_status(status)
+
+
+def disable_logging() -> None:
+    """Disable Rust logging output."""
+    lib = _get_log_lib()
+    _bind_logging(lib)
+    status = Status(lib.resolver_log_disable())
+    _raise_for_status(status)
 
 
 def _as_view(value: str) -> ResolverStringView:

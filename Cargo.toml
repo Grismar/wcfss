@@ -8,6 +8,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "0.2"
+log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_Security"] }

@@ -187,6 +187,27 @@ pub struct ResolverResolvedPath {
     pub value: ResolverStringView,
 }
 
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResolverLogLevel {
+    Off = 0,
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Trace = 5,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ResolverLogRecord {
+    pub level: ResolverLogLevel,
+    pub target: ResolverStringView,
+    pub message: ResolverStringView,
+    pub file: ResolverStringView,
+    pub line: u32,
+}
+
 pub const RESOLVER_FLAG_FAIL_ON_ANY_INVALID_UTF8_ENTRY: u32 = 1 << 0;
 pub const RESOLVER_FLAG_ENABLE_WINDOWS_ABSOLUTE_PATHS: u32 = 1 << 1;
 pub const RESOLVER_PLAN_TARGET_EXISTS: u32 = 1 << 0;

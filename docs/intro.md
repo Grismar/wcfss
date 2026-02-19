@@ -109,3 +109,6 @@ This repository now includes initial bindings under `bindings/`:
 - `bindings/rust/lib.rs`: safe wrapper over the C ABI with `Drop` and `Result` mapping.
 
 These bindings are thin and intentionally map 1:1 to the C ABI described in §19 of `docs/spec.md`. They do not introduce behavioral changes; they only handle ownership rules, type conversions, and error handling.
+
+## Changelog (selected)
+- 2026-02-19: Logging is quiet by default; opt-in APIs allow stderr logging or Python/Fortran-controlled logging.

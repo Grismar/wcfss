@@ -21,6 +21,13 @@ module wcfss
   integer(c_int), parameter, public :: RESOLVER_IO_ERROR = 14
   integer(c_int), parameter, public :: RESOLVER_INVALID_PATH = 15
 
+  integer(c_int), parameter, public :: RESOLVER_LOG_OFF = 0
+  integer(c_int), parameter, public :: RESOLVER_LOG_ERROR = 1
+  integer(c_int), parameter, public :: RESOLVER_LOG_WARN = 2
+  integer(c_int), parameter, public :: RESOLVER_LOG_INFO = 3
+  integer(c_int), parameter, public :: RESOLVER_LOG_DEBUG = 4
+  integer(c_int), parameter, public :: RESOLVER_LOG_TRACE = 5
+
   integer(c_int), parameter, public :: INTENT_STAT_EXISTS = 0
   integer(c_int), parameter, public :: INTENT_READ = 1
   integer(c_int), parameter, public :: INTENT_WRITE_TRUNCATE = 2
@@ -156,6 +163,9 @@ module wcfss
   public :: wcfss_set_root_mapping
   public :: wcfss_plan_destroy
   public :: wcfss_diag_destroy
+  public :: wcfss_log_set_stderr
+  public :: wcfss_log_set_level
+  public :: wcfss_log_disable
 
   interface
      function resolver_create(config) bind(C, name="resolver_create")
@@ -222,6 +232,23 @@ module wcfss
        type(c_ptr), value :: out_result
        type(c_ptr), value :: out_diag
      end function resolver_execute_unlink
+
+     function resolver_log_set_stderr(level) bind(C, name="resolver_log_set_stderr")
+       import :: c_int
+       integer(c_int) :: resolver_log_set_stderr
+       integer(c_int), value :: level
+     end function resolver_log_set_stderr
+
+     function resolver_log_set_level(level) bind(C, name="resolver_log_set_level")
+       import :: c_int
+       integer(c_int) :: resolver_log_set_level
+       integer(c_int), value :: level
+     end function resolver_log_set_level
+
+     function resolver_log_disable() bind(C, name="resolver_log_disable")
+       import :: c_int
+       integer(c_int) :: resolver_log_disable
+     end function resolver_log_disable
 
      function resolver_execute_open_return_path(handle, base_dir, input_path, intent, out_resolved, out_diag) &
          bind(C, name="resolver_execute_open_return_path")
@@ -401,6 +428,23 @@ contains
     diag%entries%ptr = c_null_ptr
     diag%entries%len = 0_c_size_t
   end subroutine wcfss_diag_destroy
+
+  function wcfss_log_set_stderr(level) result(status)
+    integer(c_int), intent(in) :: level
+    integer(c_int) :: status
+    status = resolver_log_set_stderr(level)
+  end function wcfss_log_set_stderr
+
+  function wcfss_log_set_level(level) result(status)
+    integer(c_int), intent(in) :: level
+    integer(c_int) :: status
+    status = resolver_log_set_level(level)
+  end function wcfss_log_set_level
+
+  function wcfss_log_disable() result(status)
+    integer(c_int) :: status
+    status = resolver_log_disable()
+  end function wcfss_log_disable
 
   function wcfss_execute_from_plan(handle, plan, result_out, diag) result(status)
     type(c_ptr), intent(in) :: handle

@@ -8,6 +8,7 @@ wcfss/
 │           └── UnicodeData.txt
 ├── src/
 │   ├── lib.rs              # Public C ABI + platform dispatch
+│   ├── logging.rs          # Logging facade and C ABI helpers (quiet by default)
 │   ├── common/             # Shared types
 │   │   ├── mod.rs
 │   │   └── types.rs        # Status codes, config structs, FFI structs
