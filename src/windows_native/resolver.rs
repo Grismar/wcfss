@@ -446,6 +446,14 @@ fn resolve_path_for_intent(
                 ParsedComponent::Parent => {
                     trace(&format!("Encountered .. in {}", current.display()));
                     if stack.len() <= 1 {
+                        if let Some(diag) = diag.as_deref_mut() {
+                            diag.push(
+                                ResolverDiagCode::EscapesRoot,
+                                ResolverDiagSeverity::Error,
+                                current.display().to_string(),
+                                "path escapes root".to_string(),
+                            );
+                        }
                         return Err(ResolverStatus::EscapesRoot);
                     }
                     let (_, was_symlink) = stack.pop().unwrap();
@@ -568,6 +576,14 @@ fn resolve_parent_and_leaf(
                     return Err(ResolverStatus::InvalidPath);
                 }
                 if stack.len() <= 1 {
+                    if let Some(diag) = diag.as_deref_mut() {
+                        diag.push(
+                            ResolverDiagCode::EscapesRoot,
+                            ResolverDiagSeverity::Error,
+                            current.display().to_string(),
+                            "path escapes root".to_string(),
+                        );
+                    }
                     return Err(ResolverStatus::EscapesRoot);
                 }
                 let (_, was_symlink) = stack.pop().unwrap();
@@ -1000,6 +1016,12 @@ impl Resolver for WindowsResolver {
             match component {
                 ParsedComponent::Parent => {
                     if stack.len() <= 1 {
+                        diag.push(
+                            ResolverDiagCode::EscapesRoot,
+                            ResolverDiagSeverity::Error,
+                            current.display().to_string(),
+                            "path escapes root".to_string(),
+                        );
                         write_diag_entries(_out_diag, &diag);
                         return ResolverStatus::EscapesRoot;
                     }
