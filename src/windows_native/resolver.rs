@@ -1765,7 +1765,7 @@ impl Resolver for WindowsResolver {
         out_list.count = 0;
         out_list.reserved = [0; 4];
 
-        let input_path = match string_view_to_string(input_path) {
+        let input_path = match unsafe { string_view_to_string(input_path) } {
             Ok(value) => value,
             Err(status) => return status,
         };
